@@ -1,0 +1,33 @@
+manifestVersion: 1
+id: fafo-farm-app
+name: Farm Management
+tagline: Track clock-ins, field notes, and farm business operations
+icon: https://raw.githubusercontent.com/polehntim/farm-app/main/icon.png
+category: productivity
+version: "1.0.0"
+port: 5000
+description: >-
+  A comprehensive farm management and ERP system for agricultural operations.
+  Track employee clock-ins and hours, manage field notes with photo attachments,
+  monitor crop cycles and planting schedules, handle double-entry accounting
+  with budgets and financial statements, plan activities and allocate resources,
+  track pests and diseases, view satellite NDVI and ET0 crop health metrics,
+  manage inventory and business assets, and maintain full traceability with
+  QR codes and GS1 barcodes. Built with security in mind featuring encrypted
+  file storage and seed phrase vault management.
+developer: Tim Polehn
+website: ""
+repo: https://github.com/polehntim/farm-app
+support: https://github.com/polehntim/farm-app/issues
+gallery:
+  - https://raw.githubusercontent.com/polehntim/farm-app/main/gallery/1.png
+  - https://raw.githubusercontent.com/polehntim/farm-app/main/gallery/2.png
+  - https://raw.githubusercontent.com/polehntim/farm-app/main/gallery/3.png
+dependencies: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+deterministicPassword: false
+torOnly: false
+submitter: Tim Polehn
+submission: https://github.com/getumbrel/umbrel-apps
