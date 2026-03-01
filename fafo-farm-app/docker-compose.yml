@@ -1,14 +1,11 @@
 version: "3.7"
 
 services:
-
-  app_proxy:
-    environment:
-      # The format here is: <app-id>_<docker-service-name>_1
-      APP_HOST: sparkles-hello-world_server_1
-      APP_PORT: 3000
-    
-  server:
-    image: getumbrel/community-app-store-hello-world:latest
-    user: "1000:1000"
-    init: true
+  farm-app:                    # ← keep this name or match your internal service
+    image: polehntim/farm-app:v1.0.0
+    restart: on-failure
+    stop_grace_period: 1m
+    ports:
+      - "3000:3000"            # Left = Umbrel external port (must match umbrel-app.yml), Right = port inside your container
+    volumes:
+      - ${APP_DATA_DIR}/data:/data   # optional — add if your app needs persistent storage
