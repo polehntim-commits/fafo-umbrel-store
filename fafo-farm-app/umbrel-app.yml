@@ -12,7 +12,7 @@ developer: polehntim
 website: https://github.com/polehntim-commits
 repo: https://github.com/polehntim-commits/fafo-umbrel-store
 support: https://github.com/polehntim-commits/fafo-umbrel-store/issues
-port: 3000                 # ←←← CHANGE THIS to your app's actual web port!
+port: 3000
 gallery:
   - 1.png
   - 2.png
