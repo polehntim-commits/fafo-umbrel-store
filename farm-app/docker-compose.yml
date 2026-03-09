@@ -1,0 +1,65 @@
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: farm-app_server_1
+      APP_PORT: 5000
+    image: getumbrel/app-proxy:v1.3.0
+    restart: on-failure
+    networks:
+      default:
+        ipv4_address: $APP_FARM_APP_PROXY_IP
+    depends_on:
+      - server
+
+  server:
+    image: polehntim/farm-app:v0.1.0-alpha
+    build: .
+    restart: on-failure
+    stop_grace_period: 1m
+    environment:
+      # Core Flask settings
+      APP_DATA_DIR: /data
+      FLASK_SECRET_KEY: $APP_SEED
+      FLASK_ENV: production
+      FLASK_HOST: "0.0.0.0"
+
+      # Security — set FLASK_HTTPS=true if behind HTTPS reverse proxy
+      FLASK_HTTPS: "false"
+
+      # Vault — leave empty to require manual unlock via UI
+      VAULT_KEY: ""
+
+      # PII Encryption salt — change this once before first deploy, then never change it
+      FARM_APP_VAULT_SALT: ""
+
+      # Gunicorn workers — 2 is fine for Umbrel (Raspberry Pi / low-resource)
+      GUNICORN_WORKERS: "2"
+
+      # Optional integrations (leave empty to disable)
+      SENTINEL_HUB_INSTANCE_ID: ""
+      SENTINEL_HUB_CLIENT_ID: ""
+      SENTINEL_HUB_CLIENT_SECRET: ""
+      BITCOIN_RPC_URL: ""
+      BITCOIN_RPC_USER: ""
+      BITCOIN_RPC_PASS: ""
+      OPENAI_API_KEY: ""
+      XAI_API_KEY: ""
+      PLAID_CLIENT_ID: ""
+      PLAID_SECRET: ""
+      GOOGLE_CLIENT_ID: ""
+      GOOGLE_CLIENT_SECRET: ""
+    volumes:
+      - ${APP_DATA_DIR}/data/farm-app:/data
+    networks:
+      default:
+        ipv4_address: $APP_FARM_APP_SERVER_IP
+
+networks:
+  default:
+    name: farm-app_main_network
+    ipam:
+      driver: default
+      config:
+        - subnet: $APP_FARM_APP_NETWORK

@@ -1,0 +1,43 @@
+manifestVersion: 1
+id: farm-app
+name: Farm Management
+tagline: Complete farm ERP — crops, employees, finances, and compliance
+icon: https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/farm-app/icon.png
+category: productivity
+version: "0.1.0-alpha"
+port: 5000
+description: >-
+  A comprehensive farm management and ERP system for agricultural operations.
+  Track employee clock-ins and hours with QR code scanning, manage field notes
+  with photo attachments, monitor crop cycles using BBCH growth stages, handle
+  double-entry accounting with budgets and financial statements, manage payroll
+  with W-2 and 1099 generation, plan activities with Kanban boards and Gantt
+  charts, track pests and beneficial organisms, view satellite NDVI and ET0
+  crop health metrics, manage purchasing and inventory, maintain food safety
+  HACCP plans, track training and certifications, ensure export compliance
+  with MRL monitoring, and maintain full traceability with QR codes.
+
+  Built with enterprise security including encrypted file storage, PII
+  encryption at rest via Fernet vault, role-based access control, CSRF
+  protection, brute-force login protection, and rate limiting.
+
+  Includes bilingual help documentation (English and Spanish) with automatic
+  browser language detection.
+
+  This is an alpha release intended for testing and feedback.
+developer: Tim Polehn
+website: ""
+repo: https://github.com/polehntim-commits/fafo-umbrel-store
+support: https://github.com/polehntim-commits/fafo-umbrel-store/issues
+gallery:
+  - https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/farm-app/gallery/1.png
+  - https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/farm-app/gallery/2.png
+  - https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/farm-app/gallery/3.png
+dependencies: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+deterministicPassword: false
+torOnly: false
+submitter: Tim Polehn
+submission: https://github.com/polehntim-commits/fafo-umbrel-store
