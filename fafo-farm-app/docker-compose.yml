@@ -8,6 +8,7 @@ services:
 
   server:
     image: polehntim/farm-app:v0.1.0-alpha
+    user: "1000:1000"
     restart: on-failure
     stop_grace_period: 1m
     environment:
