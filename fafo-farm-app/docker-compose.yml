@@ -3,7 +3,7 @@ version: "3.7"
 services:
   app_proxy:
     environment:
-      APP_HOST: farm-app_server_1
+      APP_HOST: fafo-farm-app_server_1
       APP_PORT: 5000
 
   server:
@@ -20,4 +20,4 @@ services:
       FARM_APP_VAULT_SALT: ""
       GUNICORN_WORKERS: "2"
     volumes:
-      - ${APP_DATA_DIR}/data/farm-app:/data
+      - ${APP_DATA_DIR}/data/fafo-farm-app:/data

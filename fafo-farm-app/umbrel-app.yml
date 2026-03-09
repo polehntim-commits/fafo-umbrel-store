@@ -1,9 +1,11 @@
-manifestVersion: 1.1
-id: farm-app
-category: productivity
+manifestVersion: 1
+id: fafo-farm-app
 name: Farm Management
-version: "0.1.0-alpha"
 tagline: Complete farm ERP — crops, employees, finances, and compliance
+icon: https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/fafo-farm-app/icon.png
+category: productivity
+version: "0.1.0-alpha"
+port: 5000
 description: >-
   A comprehensive farm management and ERP system for agricultural operations.
   Track employee clock-ins and hours with QR code scanning, manage field notes
@@ -20,18 +22,19 @@ description: >-
   Includes bilingual help documentation (English and Spanish) with automatic
   browser language detection.
   This is an alpha release intended for testing and feedback.
+developer: Tim Polehn
 website: ""
-dependencies: []
 repo: https://github.com/polehntim-commits/fafo-umbrel-store
 support: https://github.com/polehntim-commits/fafo-umbrel-store/issues
-port: 5000
 gallery:
-  - 1.png
-  - 2.png
-  - 3.png
+  - https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/fafo-farm-app/gallery/1.png
+  - https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/fafo-farm-app/gallery/2.png
+  - https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/fafo-farm-app/gallery/3.png
+dependencies: []
 path: ""
 defaultUsername: ""
 defaultPassword: ""
-developer: Tim Polehn
+deterministicPassword: false
+torOnly: false
 submitter: Tim Polehn
 submission: https://github.com/polehntim-commits/fafo-umbrel-store
