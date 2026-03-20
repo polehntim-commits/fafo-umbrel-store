@@ -4,7 +4,7 @@ name: Farm Management
 tagline: Complete farm ERP — crops, employees, finances, and compliance
 icon: https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/fafo-farm-app/icon.png
 category: productivity
-version: "0.1.0-alpha"
+version: "0.1.1-alpha"
 port: 5000
 description: >-
   A comprehensive farm management and ERP system for agricultural operations.
