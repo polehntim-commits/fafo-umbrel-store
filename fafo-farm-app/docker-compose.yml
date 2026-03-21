@@ -19,6 +19,6 @@ services:
       FLASK_HTTPS: "false"
       VAULT_KEY: ""
       FARM_APP_VAULT_SALT: ""
-      GUNICORN_WORKERS: "2"
+      GUNICORN_WORKERS: "1"
     volumes:
       - ${APP_DATA_DIR}/data/fafo-farm-app:/data
