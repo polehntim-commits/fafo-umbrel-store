@@ -27,7 +27,6 @@ services:
       - ${APP_DATA_DIR}/data/fafo-farm-app:/data
     tmpfs:
       - /tmp:size=64m,mode=1777
-    read_only: true
     security_opt:
       - no-new-privileges:true
     mem_limit: 512m
