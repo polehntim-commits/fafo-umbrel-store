@@ -7,7 +7,7 @@ services:
       APP_PORT: 5000
 
   server:
-    image: polehntim/farm-app:v0.1.4-alpha
+    image: polehntim/farm-app:v0.1.5-alpha
     restart: on-failure
     stop_grace_period: 1m
     environment:
