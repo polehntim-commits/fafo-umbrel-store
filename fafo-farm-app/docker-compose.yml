@@ -3,11 +3,12 @@ version: "3.7"
 services:
   app_proxy:
     environment:
-      APP_HOST: server
+      APP_HOST: fafo-farm-app_server_1
       APP_PORT: 5000
 
   server:
     image: polehntim/farm-app:v0.1.1-alpha
+    container_name: fafo-farm-app_server_1
     user: "1000:1000"
     restart: on-failure
     stop_grace_period: 1m
