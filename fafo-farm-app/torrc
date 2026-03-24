@@ -1,0 +1,3 @@
+# Farm App Hidden Service
+HiddenServiceDir /data/app-fafo-farm-app
+HiddenServicePort 5000 fafo-farm-app-server-1:5000
