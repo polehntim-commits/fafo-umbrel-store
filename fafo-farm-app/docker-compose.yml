@@ -1,5 +1,3 @@
-version: "3.7"
-
 services:
   app_proxy:
     environment:
@@ -9,7 +7,6 @@ services:
   server:
     image: polehntim/farm-app:v0.1.1-alpha
     container_name: fafo-farm-app_server_1
-    user: "1000:1000"
     restart: on-failure
     stop_grace_period: 1m
     environment:
@@ -30,8 +27,6 @@ services:
       - ${APP_DATA_DIR}/data:/data
     tmpfs:
       - /tmp:size=64m,mode=1777
-    security_opt:
-      - no-new-privileges:true
     mem_limit: 512m
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/login"]
