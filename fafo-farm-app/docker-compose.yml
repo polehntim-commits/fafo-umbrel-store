@@ -27,7 +27,7 @@ services:
       MALLOC_ARENA_MAX: "2"
       GUNICORN_WORKERS: "2"
     volumes:
-      - ${APP_DATA_DIR}/data/fafo-farm-app:/data
+      - ${APP_DATA_DIR}/data:/data
     tmpfs:
       - /tmp:size=64m,mode=1777
     security_opt:
