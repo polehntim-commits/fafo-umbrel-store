@@ -25,6 +25,7 @@ services:
       GUNICORN_WORKERS: "2"
     volumes:
       - ${APP_DATA_DIR}/data:/data
+      - ${TOR_DATA_DIR}/app-fafo-farm-app:/tor_data:ro
     tmpfs:
       - /tmp:size=64m,mode=1777
     mem_limit: 512m
