@@ -45,4 +45,4 @@ services:
 
   tor_server:
     environment:
-      HS_PORTS: '80:app_proxy_fafo-farm-app:5000 5000:${APP_FARM_APP_SERVER_IP}:5000'
+      HS_PORTS: '80:app_proxy_fafo-farm-app:5000 5000:fafo-farm-app_server_1:5000'
