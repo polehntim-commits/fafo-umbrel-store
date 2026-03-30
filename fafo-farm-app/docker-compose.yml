@@ -3,8 +3,6 @@ services:
     environment:
       APP_HOST: fafo-farm-app_server_1
       APP_PORT: 5000
-    env_file:
-      - .env.app_proxy
 
   server:
     image: polehntim/farm-app:v0.1.1-alpha
@@ -46,6 +44,5 @@ services:
         max-file: "3"
 
   tor_server:
-    entrypoint: '/umbrel/custom-entrypoint.sh'
-    volumes:
-      - ./hooks/tor-entrypoint.sh:/umbrel/custom-entrypoint.sh
+    environment:
+      HS_PORTS: '80:app_proxy_fafo-farm-app:5000 5000:${APP_FARM_APP_SERVER_IP}:5000'
