@@ -43,8 +43,6 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # NOTE: tor_server service is intentionally omitted.
-  # Umbrel injects it automatically when torEnabled: true.
-  # Defining it here without an image breaks install when Tor is disabled.
-  # Custom HS_PORTS for iOS direct access (port 5000) can be re-added
-  # once Tor is enabled in Umbrel settings.
+  # NOTE: No tor_server override needed — Umbrel's default Tor mapping
+  # (port 80 → app_proxy → server:5000) is used by iOS.  Adding tor_server
+  # without an image breaks install when Tor is disabled in Umbrel settings.
