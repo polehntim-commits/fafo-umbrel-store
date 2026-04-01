@@ -43,6 +43,8 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  tor_server:
-    environment:
-      HS_PORTS: '80:app_proxy_fafo-farm-app:5000 5000:fafo-farm-app_server_1:5000'
+  # NOTE: tor_server service is intentionally omitted.
+  # Umbrel injects it automatically when torEnabled: true.
+  # Defining it here without an image breaks install when Tor is disabled.
+  # Custom HS_PORTS for iOS direct access (port 5000) can be re-added
+  # once Tor is enabled in Umbrel settings.
