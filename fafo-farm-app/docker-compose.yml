@@ -17,8 +17,8 @@ services:
       FLASK_ENV: production
       FLASK_HOST: "0.0.0.0"
       FLASK_HTTPS: "false"
-      VAULT_KEY: "Hzc0iKifnxdXEUqf452dZsvKLBbLQwpXzVUDjn9zH4Q="
-      FARM_APP_VAULT_SALT: "jSoyo32LIDK3eR9an24LxLJWuJqMPkp1"
+      VAULT_KEY: ""
+      FARM_APP_VAULT_SALT: ""
       OPENBLAS_NUM_THREADS: "1"
       OMP_NUM_THREADS: "1"
       PYTHONUNBUFFERED: "1"
