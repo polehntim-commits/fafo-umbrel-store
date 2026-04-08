@@ -1,17 +1,9 @@
 services:
   app_proxy:
-    image: getumbrel/app-proxy:1.0.0
     environment:
-      APP_HOST: $APP_FAFO_FARM_APP_SERVER_IP
+      APP_HOST: fafo-farm-app_server_1
       APP_PORT: 5000
-    restart: on-failure
-    volumes:
-      - ./umbrel-app.yml:/extra/umbrel-app.yml:ro
-    networks:
-      default:
-        ipv4_address: $APP_FAFO_FARM_APP_PROXY_IP
-    depends_on:
-      - server
+    container_name: fafo-farm-app_app_proxy_1
 
   server:
     image: polehntim/farm-app:v0.1.2-alpha
@@ -19,46 +11,28 @@ services:
     restart: on-failure
     stop_grace_period: 1m
     ports:
-      - "5001:5000"   # Direct API port — bypasses Umbrel's auth proxy for iOS app
+      - '5001:5000'
     environment:
       APP_DATA_DIR: /data
       FLASK_SECRET_KEY: $APP_SEED
       FLASK_ENV: production
-      FLASK_HOST: "0.0.0.0"
-      FLASK_HTTPS: "false"
+      FLASK_HOST: '0.0.0.0'
+      FLASK_HTTPS: 'false'
 
       # Vault — left empty; auto-generated and persisted on first boot.
       # The owner must visit /unlock after first install to activate vault encryption.
-      VAULT_KEY: ""
+      VAULT_KEY: ''
 
       # PII Encryption salt — auto-generated and persisted to /data/.vault_salt on first boot.
       # Set this explicitly only when migrating data from another instance.
-      FARM_APP_VAULT_SALT: ""
+      FARM_APP_VAULT_SALT: ''
 
-      # Tor data directory — Umbrel injects this at runtime.
-      TOR_DATA_DIR: ${TOR_DATA_DIR:-}
-
-      # Performance — keep threads low for Raspberry Pi
-      OPENBLAS_NUM_THREADS: "1"
-      OMP_NUM_THREADS: "1"
-      PYTHONUNBUFFERED: "1"
-      PYTHONDONTWRITEBYTECODE: "1"
-      MALLOC_ARENA_MAX: "2"
-      GUNICORN_WORKERS: "2"
-
-      # Optional integrations (leave empty to disable)
-      SENTINEL_HUB_INSTANCE_ID: ""
-      SENTINEL_HUB_CLIENT_ID: ""
-      SENTINEL_HUB_CLIENT_SECRET: ""
-      BITCOIN_RPC_URL: ""
-      BITCOIN_RPC_USER: ""
-      BITCOIN_RPC_PASS: ""
-      OPENAI_API_KEY: ""
-      XAI_API_KEY: ""
-      PLAID_CLIENT_ID: ""
-      PLAID_SECRET: ""
-      GOOGLE_CLIENT_ID: ""
-      GOOGLE_CLIENT_SECRET: ""
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      PYTHONUNBUFFERED: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      MALLOC_ARENA_MAX: '2'
+      GUNICORN_WORKERS: '2'
     volumes:
       - ${APP_DATA_DIR}/data:/data
       - ${TOR_DATA_DIR}/app-fafo-farm-app:/tor_data:ro
@@ -66,7 +40,7 @@ services:
       - /tmp:size=64m,mode=1777
     mem_limit: 512m
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/api/startup-status"]
+      test: ['CMD', 'curl', '-f', 'http://localhost:5000/api/startup-status']
       interval: 30s
       timeout: 10s
       retries: 5
@@ -74,40 +48,5 @@ services:
     logging:
       driver: json-file
       options:
-        max-size: "10m"
-        max-file: "3"
-    depends_on:
-      - tor
-    networks:
-      default:
-        ipv4_address: $APP_FAFO_FARM_APP_SERVER_IP
-
-  tor_server:
-    image: getumbrel/tor:0.4.7.8
-    restart: on-failure
-    environment:
-      HS_PORTS: '80:app_proxy_fafo-farm-app:5000 5000:fafo-farm-app_server_1:5000'
-    volumes:
-      - ${TOR_DATA_DIR}:/data
-    networks:
-      default:
-        aliases:
-          - tor_server_fafo-farm-app
-
-  tor:
-    image: getumbrel/tor:0.4.7.8@sha256:2ace83f22501f58857fa9b403009f595137fa2e7986c4fda79d82a8119072b6a
-    user: "1000:1000"
-    restart: on-failure
-    volumes:
-      - ${APP_DATA_DIR}/torrc:/etc/tor/torrc:ro
-      - ${TOR_DATA_DIR}:/data
-    environment:
-      HOME: /tmp
-
-networks:
-  default:
-    name: fafo-farm-app_main_network
-    ipam:
-      driver: default
-      config:
-        - subnet: $APP_FAFO_FARM_APP_NETWORK
+        max-size: '10m'
+        max-file: '3'
