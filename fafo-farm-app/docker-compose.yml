@@ -82,6 +82,18 @@ services:
       default:
         ipv4_address: $APP_FAFO_FARM_APP_SERVER_IP
 
+  tor_server:
+    image: getumbrel/tor:0.4.7.8
+    restart: on-failure
+    environment:
+      HS_PORTS: '80:app_proxy_fafo-farm-app:5000 5000:fafo-farm-app_server_1:5000'
+    volumes:
+      - ${TOR_DATA_DIR}:/data
+    networks:
+      default:
+        aliases:
+          - tor_server_fafo-farm-app
+
   tor:
     image: getumbrel/tor:0.4.7.8@sha256:2ace83f22501f58857fa9b403009f595137fa2e7986c4fda79d82a8119072b6a
     user: "1000:1000"
