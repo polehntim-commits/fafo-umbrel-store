@@ -2,7 +2,7 @@ version: "3.8"
 
 services:
   volume_vision:
-    build: .
+    image: polehntim/volume-vision:0.0.1bata
     container_name: volume_vision
     restart: unless-stopped
     ports:
