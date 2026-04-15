@@ -1,22 +1,29 @@
 manifestVersion: 1
-id: volume-vision
+id: fafo-volume-vision
 name: Volume Vision
-tagline: ML annotation and training data management
-icon: https://raw.githubusercontent.com/your-org/volume-vision/main/icon.png
-category: AI & ML
+tagline: ML annotation and training data management tool
+icon: https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/fafo-volume-vision/icon.png
+category: productivity
 version: "1.0.0"
 port: 5100
-description: >
-  Volume Vision is a lightweight annotation tool for machine learning training data.
-  Upload images, draw bounding boxes and polygon masks, then export to YOLO or Create ML
-  format with configurable train/val/test splits.
-developer: FAFO Farm
+description: >-
+  Volume Vision is a lightweight ML annotation and training data management pipeline
+  built for agricultural computer vision workflows.
+  Upload images, draw bounding boxes and polygon masks, and export labeled datasets
+  to YOLO (bbox and segmentation) or Create ML format with configurable train/val/test
+  splits. Manage multiple annotation projects, track annotation progress, and build
+  training datasets for on-farm machine learning models.
+  Patent Pending — provisional patent filed April 14, 2026.
+developer: Tim Polehn
 website: ""
-dependencies: []
-repo: ""
-support: ""
+repo: https://github.com/polehntim-commits/fafo-umbrel-store
+support: https://github.com/polehntim-commits/fafo-umbrel-store/issues
 gallery: []
+dependencies: []
 path: ""
 defaultUsername: ""
-defaultPassword: "changeme"
-releaseNotes: ""
+defaultPassword: ""
+deterministicPassword: false
+torOnly: false
+submitter: Tim Polehn
+submission: https://github.com/polehntim-commits/fafo-umbrel-store
