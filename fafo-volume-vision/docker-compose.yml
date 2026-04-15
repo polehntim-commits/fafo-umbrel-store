@@ -7,7 +7,7 @@ services:
       APP_PORT: 5100
 
   server:
-    image: polehntim/fafo-volume-vision:0.0.1bata
+    image: polehntim/volume-vision:0.0.1bata
     restart: on-failure
     stop_grace_period: 1m
     environment:
