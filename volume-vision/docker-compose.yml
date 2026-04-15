@@ -1,21 +1,28 @@
-version: "3.8"
-
 services:
-  volume_vision:
-    build: .
-    container_name: volume_vision
-    restart: unless-stopped
-    ports:
-      - "5100:5100"
-    volumes:
-      - volume_vision_data:/data
+  app_proxy:
     environment:
-      - DATA_DIR=/data
-      - APP_PASSWORD=${APP_PASSWORD:-changeme}
-      - SECRET_KEY=${SECRET_KEY:-change-this-secret-key}
-      - SPLIT_TRAIN=0.70
-      - SPLIT_VAL=0.20
-      - SPLIT_TEST=0.10
+      APP_HOST: volume-vision_server_1
+      APP_PORT: 5100
+    container_name: volume-vision_app_proxy_1
 
-volumes:
-  volume_vision_data:
+  server:
+    image: polehntim/volume-vision:latest
+    container_name: volume-vision_server_1
+    restart: on-failure
+    stop_grace_period: 1m
+    ports:
+      - '5101:5100'
+    environment:
+      DATA_DIR: /data
+      APP_PASSWORD: ${APP_PASSWORD:-changeme}
+      SECRET_KEY: ${APP_SEED}
+    volumes:
+      - ${APP_DATA_DIR}/data:/data
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
