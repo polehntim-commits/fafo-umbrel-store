@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Annotate Queue — {{ project.name }} — Volume Vision{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>{{ project.name }}</h1>
+    <p class="subtitle">Annotation Queue</p>
+  </div>
+  <div class="header-actions">
+    <a href="{{ url_for('projects.view_project', project_id=project.id) }}" class="btn btn-sm">Back to Project</a>
+    <a href="{{ url_for('export.export_page', project_id=project.id) }}" class="btn btn-sm">Export</a>
+  </div>
+</div>
+
+<div class="queue-filter">
+  <a href="{{ url_for('annotate.queue', project_id=project.id, show='unannotated') }}"
+     class="filter-btn {% if show == 'unannotated' %}active{% endif %}">Unannotated</a>
+  <a href="{{ url_for('annotate.queue', project_id=project.id, show='annotated') }}"
+     class="filter-btn {% if show == 'annotated' %}active{% endif %}">Annotated</a>
+  <a href="{{ url_for('annotate.queue', project_id=project.id, show='all') }}"
+     class="filter-btn {% if show == 'all' %}active{% endif %}">All</a>
+</div>
+
+{% if images %}
+<div class="image-grid">
+  {% for img in images %}
+  <div class="thumb-card {% if img.is_annotated %}is-annotated{% endif %}">
+    <a href="{{ url_for('annotate.label', project_id=project.id, image_id=img.id) }}">
+      <img src="{{ url_for('projects.uploaded_file', filename=img.filename) }}"
+           alt="{{ img.original_name }}" loading="lazy">
+      {% if img.is_annotated %}
+        <span class="badge badge-done">✓ {{ img.annotations | length }}</span>
+      {% else %}
+        <span class="badge badge-todo">Label</span>
+      {% endif %}
+    </a>
+    <div class="thumb-name">{{ img.original_name or img.filename }}</div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">
+  {% if show == 'unannotated' %}
+    <p>All images are annotated!</p>
+    <a href="{{ url_for('export.export_page', project_id=project.id) }}" class="btn btn-primary">Export Dataset</a>
+  {% else %}
+    <p>No images found.</p>
+    <a href="{{ url_for('projects.view_project', project_id=project.id) }}" class="btn btn-primary">Upload Images</a>
+  {% endif %}
+</div>
+{% endif %}
+{% endblock %}
