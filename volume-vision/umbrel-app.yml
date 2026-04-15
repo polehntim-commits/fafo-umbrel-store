@@ -3,7 +3,8 @@ id: volume-vision
 category: ai
 name: Volume Vision
 version: "0.0.1-beta"
-tagline: ML annotation and training data management
+tagline: "Opportunity is found in the void."
+icon: https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/volume-vision/icon.png
 description: >-
   Upload images, draw bounding boxes and polygon masks, then export to YOLO
   or Create ML format with configurable train/val/test splits. A lightweight
