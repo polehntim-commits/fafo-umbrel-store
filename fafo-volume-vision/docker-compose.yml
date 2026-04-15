@@ -6,12 +6,10 @@ services:
     container_name: fafo-volume-vision_app_proxy_1
 
   server:
-    build: .
+    image: polehntim/volume-vision:0.0.1bata
     container_name: fafo-volume-vision_server_1
     restart: on-failure
     stop_grace_period: 1m
-    ports:
-      - '5100:5100'
     environment:
       DATA_DIR: /data
       SECRET_KEY: $APP_SEED
