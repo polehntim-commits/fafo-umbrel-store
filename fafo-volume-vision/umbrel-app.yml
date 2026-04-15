@@ -1,0 +1,22 @@
+manifestVersion: 1
+id: volume-vision
+name: Volume Vision
+tagline: ML annotation and training data management
+icon: https://raw.githubusercontent.com/your-org/volume-vision/main/icon.png
+category: AI & ML
+version: "1.0.0"
+port: 5100
+description: >
+  Volume Vision is a lightweight annotation tool for machine learning training data.
+  Upload images, draw bounding boxes and polygon masks, then export to YOLO or Create ML
+  format with configurable train/val/test splits.
+developer: FAFO Farm
+website: ""
+dependencies: []
+repo: ""
+support: ""
+gallery: []
+path: ""
+defaultUsername: ""
+defaultPassword: "changeme"
+releaseNotes: ""
