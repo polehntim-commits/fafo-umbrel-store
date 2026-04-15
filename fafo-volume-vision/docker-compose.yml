@@ -3,11 +3,11 @@ version: "3.7"
 services:
   app_proxy:
     environment:
-      APP_HOST: volume-vision_server_1
+      APP_HOST: fafo-volume-vision_server_1
       APP_PORT: 5100
 
   server:
-    image: polehntim/volume-vision:0.0.1bata
+    image: polehntim/fafo-volume-vision:0.0.1bata
     restart: on-failure
     stop_grace_period: 1m
     environment:
@@ -19,4 +19,4 @@ services:
       SPLIT_VAL: "0.20"
       SPLIT_TEST: "0.10"
     volumes:
-      - ${APP_DATA_DIR}/data/volume-vision:/data
+      - ${APP_DATA_DIR}/data/fafo-volume-vision:/data
