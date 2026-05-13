@@ -17,8 +17,6 @@ services:
       - "5101:5100"
     environment:
       DATA_DIR: /data
-      SECRET_KEY: $APP_SEED
-      APP_PASSWORD: ${APP_PASSWORD:-changeme}
       FLASK_ENV: production
 
       SPLIT_TRAIN: '0.70'
