@@ -1,28 +1,24 @@
-version: "3.7"
-
+version: '3.7'
 services:
   app_proxy:
     environment:
       APP_HOST: fafo-volume-vision_server_1
       APP_PORT: 5100
-
+    container_name: fafo-volume-vision_app_proxy_1
   server:
-    image: polehntim/volume-vision:0.1.0
+    image: polehntim/volume-vision:0.0.1bata
     restart: on-failure
     stop_grace_period: 1m
-    command: ["gunicorn", "--bind", "0.0.0.0:5100", "--workers", "2", "--timeout", "300", "run:app"]
+    ports:
+      - "5101:5100"
     environment:
       DATA_DIR: /data
       SECRET_KEY: $APP_SEED
       APP_PASSWORD: ${APP_PASSWORD:-changeme}
       FLASK_ENV: production
-      SPLIT_TRAIN: "0.70"
-      SPLIT_VAL: "0.20"
-      SPLIT_TEST: "0.10"
-      SYNC_AUTH_REQUIRED: "true"
-      NIP98_CLOCK_SKEW_SECONDS: "120"
-      NIP98_ALLOWED_PUBKEYS: ""
-      BOOTSTRAP_API_KEY_NAME: "pc-bridge"
-      BOOTSTRAP_API_KEY: $APP_SEED
+      SPLIT_TRAIN: '0.70'
+      SPLIT_VAL: '0.20'
+      SPLIT_TEST: '0.10'
     volumes:
       - ${APP_DATA_DIR}/data/fafo-volume-vision:/data
+    container_name: fafo-volume-vision_server_1
