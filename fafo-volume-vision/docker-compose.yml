@@ -7,9 +7,10 @@ services:
       APP_PORT: 5100
 
   server:
-    image: polehntim/volume-vision:0.0.1bata
+    image: polehntim/volume-vision:0.1.0
     restart: on-failure
     stop_grace_period: 1m
+    command: ["gunicorn", "--bind", "0.0.0.0:5100", "--workers", "2", "--timeout", "300", "run:app"]
     environment:
       DATA_DIR: /data
       SECRET_KEY: $APP_SEED
@@ -18,5 +19,10 @@ services:
       SPLIT_TRAIN: "0.70"
       SPLIT_VAL: "0.20"
       SPLIT_TEST: "0.10"
+      SYNC_AUTH_REQUIRED: "true"
+      NIP98_CLOCK_SKEW_SECONDS: "120"
+      NIP98_ALLOWED_PUBKEYS: ""
+      BOOTSTRAP_API_KEY_NAME: "pc-bridge"
+      BOOTSTRAP_API_KEY: $APP_SEED
     volumes:
       - ${APP_DATA_DIR}/data/fafo-volume-vision:/data

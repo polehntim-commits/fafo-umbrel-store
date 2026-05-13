@@ -2,13 +2,35 @@ manifestVersion: 1.1
 id: fafo-volume-vision
 category: ai
 name: Volume Vision
-version: "0.0.1-beta"
+version: "0.1.0"
 tagline: "Opportunity is found in the void."
 icon: https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/fafo-volume-vision/icon.png
 description: >-
-  Upload images, draw bounding boxes and polygon masks, then export to YOLO
-  or Create ML format with configurable train/val/test splits. A lightweight
-  annotation tool for machine learning training data pipelines.
+  Volume Vision is a federated annotation and training-data platform for
+  agricultural machine learning.
+
+
+  Capture images on iPad (RGB + depth), draw bounding boxes and polygon masks,
+  organize captures with a variable-depth taxonomy (block → row → tree →
+  branch → bud, or any custom hierarchy), and export to YOLO or Create ML
+  format with configurable train/val/test splits.
+
+
+  Features:
+
+  - Variable-depth taxonomy system for organizing captures by site structure
+
+  - iOS sync API — push captures and annotations from the FAFO iPad app
+
+  - Depth image support alongside RGB
+
+  - NOSTR-signed events (NIP-98) for federated, verifiable traceability across
+    farm nodes
+
+  - PC training bridge — pull datasets to a workstation for GPU training,
+    push trained model bundles back to the node
+
+  - Model management — version, store, and serve trained model artifacts
 website: ""
 dependencies: []
 repo: https://github.com/polehntim-commits/fafo-umbrel-store
@@ -21,3 +43,15 @@ defaultPassword: "changeme"
 developer: Tim Polehn
 submitter: Tim Polehn
 submission: https://github.com/polehntim-commits/fafo-umbrel-store
+releaseNotes: >-
+  Phase 1-4 release:
+
+  - Variable-depth taxonomy
+
+  - iOS sync (captures + annotations)
+
+  - NOSTR-signed events for federated traceability
+
+  - PC training bridge (dataset pull / model push)
+
+  - Depth image support and model management
