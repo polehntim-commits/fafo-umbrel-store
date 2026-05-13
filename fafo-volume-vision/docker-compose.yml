@@ -5,20 +5,56 @@ services:
       APP_HOST: fafo-volume-vision_server_1
       APP_PORT: 5100
     container_name: fafo-volume-vision_app_proxy_1
+
   server:
-    image: polehntim/volume-vision:0.0.1bata
+    image: polehntim/volume-vision:0.1.0
+    container_name: fafo-volume-vision_server_1
     restart: on-failure
     stop_grace_period: 1m
     ports:
+      # Direct API + WebSocket access for the iOS app and NOSTR federation peers.
+      # Bypasses Umbrel's app_proxy (which only fronts the dashboard).
       - "5101:5100"
     environment:
       DATA_DIR: /data
       SECRET_KEY: $APP_SEED
       APP_PASSWORD: ${APP_PASSWORD:-changeme}
       FLASK_ENV: production
+
       SPLIT_TRAIN: '0.70'
       SPLIT_VAL: '0.20'
       SPLIT_TEST: '0.10'
+
+      # Phase 2 — iOS sync (NIP-98 auth).
+      # Empty NIP98_ALLOWED_PUBKEYS = accept any pubkey with a valid signed event.
+      SYNC_AUTH_REQUIRED: 'true'
+      NIP98_CLOCK_SKEW_SECONDS: '120'
+      NIP98_ALLOWED_PUBKEYS: ''
+
+      # First-boot API key seeding. $APP_SEED is a unique, stable per-install
+      # secret from Umbrel, so the key persists across restarts without being
+      # shared between hosts.
+      BOOTSTRAP_API_KEY: $APP_SEED
+      BOOTSTRAP_API_KEY_NAME: 'umbrel-bootstrap'
+
+      # Extend gunicorn timeout to 300s so large image uploads from the iOS app
+      # and bulk model-bundle pushes from the PC training bridge don't get cut off.
+      # Passed via GUNICORN_CMD_ARGS so we don't override the image's default
+      # CMD (which knows the correct WSGI module path).
+      GUNICORN_CMD_ARGS: '--timeout 300 --graceful-timeout 300'
+
+      PYTHONUNBUFFERED: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
     volumes:
       - ${APP_DATA_DIR}/data/fafo-volume-vision:/data
-    container_name: fafo-volume-vision_server_1
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://localhost:5100/health']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
