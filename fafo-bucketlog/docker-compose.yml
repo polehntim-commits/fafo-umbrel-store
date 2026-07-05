@@ -6,20 +6,19 @@ services:
       APP_HOST: fafo-bucketlog_server_1
       APP_PORT: 5200
 
-  postgres:
+  # Postgres sidecar. Named `db` (not `postgres`) because umbreld's
+  # community-app compose merger strips services outside its
+  # whitelist, and `db` is the name Umbrel's own Nextcloud app uses
+  # for its postgres sidecar — best bet for surviving the filter.
+  db:
     image: postgres:16-alpine
     restart: on-failure
     stop_grace_period: 1m
     environment:
       POSTGRES_USER: bucketlog
-      # APP_SEED is Umbrel's per-install stable secret. Reusing it here
-      # keeps the DB password persistent across container recreations
-      # without shipping a fixed default.
       POSTGRES_PASSWORD: "${APP_SEED}"
       POSTGRES_DB: bucketlog
-      # Force Postgres to write TZ-aware timestamps in UTC. Everything
-      # in the app models is UTC — the DB matching prevents subtle
-      # off-by-timezone bugs on reports.
+      # Force Postgres to write TZ-aware timestamps in UTC.
       PGTZ: "UTC"
     volumes:
       - ${APP_DATA_DIR}/postgres:/var/lib/postgresql/data
@@ -34,7 +33,7 @@ services:
     restart: on-failure
     stop_grace_period: 1m
     depends_on:
-      postgres:
+      db:
         condition: service_healthy
     ports:
       # Direct Flask on 5201 — bypasses the Umbrel app_proxy which
@@ -46,10 +45,10 @@ services:
       SECRET_KEY: "${APP_SEED}"
       BOOTSTRAP_API_KEY: "${APP_SEED}"
       NIP98_CLOCK_SKEW_SECONDS: "120"
-      # PostgreSQL — the compose network resolves `postgres` to the
-      # sidecar container. MVCC eliminates the SQLite lock storms
-      # Volume Vision hits under concurrent relay + sync writes.
-      DATABASE_URL: "postgresql://bucketlog:${APP_SEED}@postgres:5432/bucketlog"
+      # PostgreSQL — the compose network resolves `db` to the sidecar
+      # container. MVCC eliminates the SQLite lock storms Volume
+      # Vision hits under concurrent relay + sync writes.
+      DATABASE_URL: "postgresql://bucketlog:${APP_SEED}@db:5432/bucketlog"
       RELAY_LIST: "wss://relay.damus.io,wss://nos.lol"
       SUBSCRIBER_ENABLED: "true"
       # Outbound Tor SOCKS5 proxy — used by the Nostr relay subscriber
