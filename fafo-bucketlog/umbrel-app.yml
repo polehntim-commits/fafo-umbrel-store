@@ -1,0 +1,25 @@
+manifestVersion: 1.1
+id: fafo-bucketlog
+category: productivity
+name: BucketLog
+version: "0.0.1-alpha"
+tagline: "Auto-gated bucket logging, on your farm."
+icon: https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/fafo-bucketlog/icon.png
+description: >-
+  Companion server for the iOS BucketLog app. Records every accepted
+  bucket during a picking session, publishes each as a signed NOSTR
+  event under the Agriculture Protocol, and exports to Ganeze
+  payroll (CSV) and Farmers Office (XML). Pairs with the phone in
+  one handshake — no admin flow.
+website: ""
+dependencies: []
+repo: https://github.com/polehntim-commits/fafo-umbrel-store
+support: https://github.com/polehntim-commits/fafo-umbrel-store/issues
+port: 5200
+gallery: []
+path: ""
+defaultUsername: ""
+defaultPassword: "changeme"
+developer: Tim Polehn
+submitter: Tim Polehn
+submission: https://github.com/polehntim-commits/fafo-umbrel-store
