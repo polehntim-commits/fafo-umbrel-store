@@ -1,0 +1,36 @@
+manifestVersion: 1.1
+id: fafo-erpnext
+category: business
+name: ERPNext + Agriculture
+version: "15.0.0"
+tagline: "Full-stack ERP with the Agriculture domain preinstalled."
+icon: https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/fafo-erpnext/icon.png
+description: >-
+  ERPNext v15 (the open-source ERP built on the Frappe framework)
+  running on the Umbrel with the Agriculture domain app
+  auto-installed on first boot.
+
+  ERPNext handles the business ledger — sales orders, purchase orders,
+  accounting, HR/payroll, inventory, invoicing. The Agriculture module
+  adds DocTypes for Crop, Land Unit, Crop Cycle, Disease, Fertilizer,
+  Water Analysis, Soil Analysis, and Weather. Together they give you
+  a working baseline farm ERP that you can extend by installing custom
+  Frappe apps (e.g. cherry-industry piece rate, block-level cost
+  tracking, harvest attestations) alongside.
+
+  First boot takes 5-10 minutes while the site is created and the
+  apps are installed. Default admin user is `Administrator`, password
+  is auto-generated as `APP_PASSWORD` (set by Umbrel, visible in the
+  app credentials screen).
+website: "https://frappe.io/erpnext"
+dependencies: []
+repo: https://github.com/frappe/erpnext,https://github.com/frappe/agriculture
+support: https://github.com/polehntim-commits/fafo-umbrel-store/issues
+port: 5300
+gallery: []
+path: ""
+defaultUsername: "Administrator"
+defaultPassword: "$APP_PASSWORD"
+developer: Frappe Technologies (packaged by Tim Polehn)
+submitter: Tim Polehn
+submission: https://github.com/polehntim-commits/fafo-umbrel-store

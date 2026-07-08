@@ -1,0 +1,239 @@
+version: "3.7"
+
+# ERPNext v15 + Agriculture module, packaged for Umbrel community
+# app stores. Follows the frappe/frappe_docker standard topology
+# (single image, role selected via `command:`) so upgrades track
+# upstream cleanly.
+#
+# Services:
+#   app_proxy    — Umbrel-provided reverse proxy → routes to frontend
+#   db           — MariaDB 10.6 (ERPNext requires MariaDB, not Postgres)
+#   redis        — Single Redis instance, shared across cache/queue/socketio
+#   configurator — one-shot init: writes common_site_config.json with
+#                  db + redis hostnames the Frappe workers read
+#   backend      — Frappe Python app (gunicorn on 8000)
+#   frontend     — Nginx serving static assets + proxying backend + websocket
+#   websocket    — Node socketio for real-time UI updates
+#   queue-short  — Background worker for short + default queues
+#   queue-long   — Background worker for the long queue (long-running jobs)
+#   scheduler    — Cron-like scheduler
+#   create-site  — one-shot init: `bench new-site`, installs erpnext +
+#                  agriculture on the site named `${APP_DOMAIN}`
+#
+# `configurator` and `create-site` run once, mark completion, and
+# exit — subsequent restarts skip them via the marker files.
+#
+# Data lives under two volumes:
+#   ${APP_DATA_DIR}/db      — MariaDB data
+#   ${APP_DATA_DIR}/sites   — Frappe sites dir (shared across all app
+#                             services so gunicorn / workers / nginx
+#                             see the same site config)
+
+services:
+  # ── Umbrel proxy: routes public traffic to the nginx frontend on 8080.
+  app_proxy:
+    environment:
+      APP_HOST: fafo-erpnext_frontend_1
+      APP_PORT: 8080
+      PROXY_AUTH_ADD: "false"
+
+  # ── MariaDB 10.6 sidecar. Named `db` per Umbrel community-app-store
+  # service whitelist (custom names like `mariadb` get silently stripped
+  # from resolved compose). Same pattern as Nextcloud.
+  db:
+    image: mariadb:10.6
+    restart: on-failure
+    stop_grace_period: 1m
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --skip-innodb-read-only-compressed
+    environment:
+      MYSQL_ROOT_PASSWORD: "${APP_SEED}"
+    volumes:
+      - ${APP_DATA_DIR}/db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost",
+             "-uroot", "-p${APP_SEED}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # ── Redis: unified single instance. Frappe uses three logical Redis
+  # databases (cache=0, queue=1, socketio=2) — a single Redis process
+  # supports all three via `SELECT`. Saves ~200 MB RAM vs three
+  # separate containers, which matters on a Pi.
+  redis:
+    image: redis:7-alpine
+    restart: on-failure
+    volumes:
+      - ${APP_DATA_DIR}/redis:/data
+
+  # ── Configurator: one-shot. Writes /home/frappe/frappe-bench/sites/
+  # common_site_config.json with the db+redis hostnames the workers
+  # read. Runs to completion, exits 0; subsequent restarts see the
+  # existing config and skip.
+  configurator:
+    image: frappe/erpnext:v15.42.4
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+          ls -1 apps > sites/apps.txt;
+          bench set-config -g db_host $$DB_HOST;
+          bench set-config -gp db_port $$DB_PORT;
+          bench set-config -g redis_cache "redis://$$REDIS_CACHE";
+          bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
+          bench set-config -g redis_socketio "redis://$$REDIS_SOCKETIO";
+          bench set-config -gp socketio_port $$SOCKETIO_PORT;
+    environment:
+      DB_HOST: fafo-erpnext_db_1
+      DB_PORT: "3306"
+      REDIS_CACHE: fafo-erpnext_redis_1:6379/0
+      REDIS_QUEUE: fafo-erpnext_redis_1:6379/1
+      REDIS_SOCKETIO: fafo-erpnext_redis_1:6379/2
+      SOCKETIO_PORT: "9000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - ${APP_DATA_DIR}/sites:/home/frappe/frappe-bench/sites
+
+  # ── Backend: Frappe Python app server (gunicorn on port 8000).
+  # Handles all form submits, REST API, DocType logic. The Nginx
+  # frontend proxies non-static requests here.
+  backend:
+    image: frappe/erpnext:v15.42.4
+    restart: on-failure
+    stop_grace_period: 1m
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+    volumes:
+      - ${APP_DATA_DIR}/sites:/home/frappe/frappe-bench/sites
+
+  # ── Frontend: Nginx serving static assets + proxying to backend +
+  # websocket. Umbrel's app_proxy points at this on port 8080.
+  frontend:
+    image: frappe/erpnext:v15.42.4
+    restart: on-failure
+    depends_on:
+      backend:
+        condition: service_started
+      websocket:
+        condition: service_started
+    environment:
+      BACKEND: fafo-erpnext_backend_1:8000
+      FRAPPE_SITE_NAME_HEADER: "$$host"
+      SOCKETIO: fafo-erpnext_websocket_1:9000
+      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+      PROXY_READ_TIMEOUT: "120"
+      CLIENT_MAX_BODY_SIZE: "50m"
+    command: ["nginx-entrypoint.sh"]
+    volumes:
+      - ${APP_DATA_DIR}/sites:/home/frappe/frappe-bench/sites
+
+  # ── Websocket: Node socketio for real-time UI (typing indicators,
+  # live updates, comment notifications). Not strictly required but
+  # ERPNext UX degrades without it.
+  websocket:
+    image: frappe/erpnext:v15.42.4
+    restart: on-failure
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+    command:
+      - node
+      - /home/frappe/frappe-bench/apps/frappe/socketio.js
+    volumes:
+      - ${APP_DATA_DIR}/sites:/home/frappe/frappe-bench/sites
+
+  # ── Queue workers: pick jobs off the redis queue database and
+  # execute background tasks (emails, reports, scheduled jobs).
+  # Split into short and long for job priority.
+  queue-short:
+    image: frappe/erpnext:v15.42.4
+    restart: on-failure
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+    command: ["bench", "worker", "--queue", "short,default"]
+    volumes:
+      - ${APP_DATA_DIR}/sites:/home/frappe/frappe-bench/sites
+
+  queue-long:
+    image: frappe/erpnext:v15.42.4
+    restart: on-failure
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+    command: ["bench", "worker", "--queue", "long"]
+    volumes:
+      - ${APP_DATA_DIR}/sites:/home/frappe/frappe-bench/sites
+
+  # ── Scheduler: fires scheduled DocType events (daily / hourly / cron)
+  # into the queue-short worker. Without this, scheduled reports and
+  # background integrations never run.
+  scheduler:
+    image: frappe/erpnext:v15.42.4
+    restart: on-failure
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+    command: ["bench", "schedule"]
+    volumes:
+      - ${APP_DATA_DIR}/sites:/home/frappe/frappe-bench/sites
+
+  # ── Create-site: one-shot. On first boot, creates the default site
+  # named after the Umbrel app domain, installs ERPNext, then fetches
+  # + installs the Agriculture app from frappe/agriculture master.
+  #
+  # Uses a marker file (`sites/.site-created`) so subsequent boots
+  # skip the site-creation step. To reset, delete the file and the
+  # site's dir under `sites/`; the next boot will rebuild.
+  create-site:
+    image: frappe/erpnext:v15.42.4
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+          set -e
+          if [ -f /home/frappe/frappe-bench/sites/.site-created ]; then
+            echo "[create-site] marker exists — site already created, exiting."
+            exit 0
+          fi
+          echo "[create-site] waiting for DB..."
+          wait-for-it -t 120 fafo-erpnext_db_1:3306
+          echo "[create-site] creating site $$SITE_NAME..."
+          bench new-site "$$SITE_NAME" \
+            --db-root-username root \
+            --db-root-password "$$DB_ROOT_PASS" \
+            --admin-password "$$ADMIN_PASS" \
+            --install-app erpnext \
+            --set-default \
+            --force
+          echo "[create-site] fetching Agriculture app from frappe/agriculture..."
+          bench get-app --branch develop agriculture https://github.com/frappe/agriculture.git || \
+            echo "[create-site] agriculture get-app failed — continuing without it, install manually via UI."
+          echo "[create-site] installing Agriculture app on site..."
+          bench --site "$$SITE_NAME" install-app agriculture || \
+            echo "[create-site] agriculture install-app failed — site is up without it."
+          touch /home/frappe/frappe-bench/sites/.site-created
+          echo "[create-site] complete."
+    environment:
+      SITE_NAME: "frontend"
+      DB_ROOT_PASS: "${APP_SEED}"
+      ADMIN_PASS: "${APP_PASSWORD}"
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+    volumes:
+      - ${APP_DATA_DIR}/sites:/home/frappe/frappe-bench/sites
