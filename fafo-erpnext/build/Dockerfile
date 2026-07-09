@@ -72,20 +72,73 @@ RUN sed -i 's/^bind .*/bind 127.0.0.1 ::1/' /etc/redis/redis.conf && \
 # and file ownership. Fails soft with `|| true` so a network hiccup
 # during build doesn't kill the whole image; entrypoint will note
 # the missing app and skip cleanly.
+#
+# TWO-STEP install to defeat two long-standing footguns:
+#   1. `bench get-app` sometimes reports success but leaves the app
+#      un-pip-installed. We follow with an explicit `pip install -e`
+#      + --force-reinstall so the editable install is guaranteed.
+#   2. Docker's layer cache doesn't know when GitHub has new commits.
+#      The ADD https://api.github.com/... below returns the current
+#      HEAD SHA in its body; when agriculture develop advances the
+#      SHA changes and Docker invalidates every layer from here down,
+#      forcing a fresh clone + install.
+
+# ── Cache-bust when frappe/agriculture develop advances ──────────
+# Same pattern as farm_i9 below. Less frequently updated so the
+# cache-bust rarely fires, but consistency is worth the one extra
+# HTTP request at build time.
+ADD https://api.github.com/repos/frappe/agriculture/commits/develop /tmp/.agriculture_head.json
 USER frappe
 RUN cd /home/frappe/frappe-bench && \
     (bench get-app --branch develop agriculture https://github.com/frappe/agriculture.git \
-     || echo "[dockerfile] agriculture get-app failed at build — image will run without it")
+     || echo "[dockerfile] agriculture get-app failed at build — will attempt pip install anyway") && \
+    (if [ -d apps/agriculture ]; then \
+        env/bin/pip install -e apps/agriculture --force-reinstall --no-deps \
+            || echo "[dockerfile] agriculture pip install failed — image ships without a runnable agriculture"; \
+     else \
+        echo "[dockerfile] apps/agriculture dir missing — nothing to pip install"; \
+     fi)
 USER root
 
 # ── Bake polehntim/farm_i9 into the image ─────────────────────────
 # Custom I-9 employment eligibility workflow app. Same pattern as
 # agriculture above — clone at build time so the code survives
 # container recreates (Umbrel bind-mounts sites/ but not apps/).
+#
+# TWO-STEP install to defeat two long-standing footguns:
+#   1. `bench get-app` sometimes reports success but leaves the app
+#      un-pip-installed. We follow with an explicit `pip install -e`
+#      + --force-reinstall so the editable install is guaranteed.
+#   2. Docker's layer cache doesn't know when GitHub has new commits.
+#      The ADD https://api.github.com/... above returns the current
+#      HEAD SHA in its body; when Tim pushes new farm_i9 code the
+#      SHA changes and Docker invalidates every layer from here down,
+#      forcing a fresh clone + install.
+#
+# The `|| echo "..."` guards keep a network hiccup or one-off failure
+# from killing the whole build — the entrypoint's app-reconcile
+# block also runs `bench install-app` at runtime and can fill in the
+# gap if this step went sideways.
+
+# ── Cache-bust when farm_i9 main branch advances ──────────────────
+# Docker's ADD instruction fetches the URL response body as a cache
+# key. GitHub's commits API returns the current HEAD commit SHA in
+# its response — when Tim pushes new commits, the SHA changes and
+# Docker invalidates every layer below this line, forcing a fresh
+# `bench get-app` + `pip install`. Without this, `docker build`
+# happily reuses the stale layer from a previous build even when
+# there's newer farm_i9 code on GitHub.
+ADD https://api.github.com/repos/polehntim-commits/farm_i9/commits/main /tmp/.farm_i9_head.json
 USER frappe
 RUN cd /home/frappe/frappe-bench && \
     (bench get-app --branch main farm_i9 https://github.com/polehntim-commits/farm_i9.git \
-     || echo "[dockerfile] farm_i9 get-app failed at build — image will run without it")
+     || echo "[dockerfile] farm_i9 get-app failed at build — will attempt pip install anyway") && \
+    (if [ -d apps/farm_i9 ]; then \
+        env/bin/pip install -e apps/farm_i9 --force-reinstall --no-deps \
+            || echo "[dockerfile] farm_i9 pip install failed — image ships without a runnable farm_i9"; \
+     else \
+        echo "[dockerfile] apps/farm_i9 dir missing — nothing to pip install"; \
+     fi)
 USER root
 
 # ── Pre-build all app assets AND cache them for restore ───────────
