@@ -27,6 +27,13 @@
 
 FROM frappe/erpnext:v15.115.0
 
+# Self-heal advertisement — lets an operator confirm at a glance
+# (`docker inspect`) that this image carries the runtime recovery
+# behavior: asset canary restore, healthcheck-driven restart, and
+# idempotent app reconcile. See entrypoint.sh for the full strategy.
+LABEL org.polehnfarm.self-heal="asset-canary,healthcheck,app-reconcile"
+LABEL org.polehnfarm.self-heal.version="1"
+
 USER root
 
 # Install supervisord to orchestrate the multiple Frappe processes,
@@ -112,6 +119,24 @@ EXPOSE 8080
 # Persisting this across container recreates is what keeps the site
 # alive between updates.
 VOLUME ["/home/frappe/frappe-bench/sites"]
+
+# HEALTHCHECK — nginx serves an unstyled page when assets are missing.
+# Poll the asset manifest endpoint; if it 404s or 500s for 90s+
+# (30s interval × 3 retries) Docker marks the container unhealthy.
+# Umbrel's watchdog restarts unhealthy containers, which triggers the
+# entrypoint's self-heal path.
+#
+# We poll /assets/assets.json (the esbuild manifest) rather than a
+# specific bundle: Frappe v15 content-hashes bundle filenames
+# (frappe-web.bundle.<HASH>.js), so there is no stable bundle URL to
+# hardcode, but assets.json always lives at a fixed path and is the
+# exact file wiped by `clear-website-cache`. `curl -f` makes any
+# non-2xx status count as failure. `curl` is already present in the
+# base frappe/erpnext:v15.115.0 image (no apt install needed). Grace
+# period of 5 min accommodates cold-boot bench new-site +
+# agriculture/farm_i9 install.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
+    CMD curl -f -o /dev/null http://127.0.0.1:8080/assets/assets.json || exit 1
 
 # Entrypoint handles first-boot site creation + agriculture install,
 # then execs supervisord to run all the Frappe processes.

@@ -1,4 +1,37 @@
 #!/bin/bash
+# ── Self-healing strategy ─────────────────────────────────────────
+# This container has three defense layers against runtime corruption:
+#
+#   1. Asset canary + snapshot restore (this file, runs every boot).
+#      Detects a missing/empty `sites/assets/` manifest and restores
+#      it from the image's `/var/lib/frappe-assets/` snapshot without
+#      a full bench build. Handles the most common failure mode
+#      (someone ran `bench clear-website-cache` and killed nginx's
+#      asset manifest — the incident that hit Tim on 2026-07-08).
+#
+#   2. Docker HEALTHCHECK (Dockerfile). If nginx returns 404/500 for
+#      the manifest URL for 90s+ (30s interval × 3 retries), Docker
+#      marks the container unhealthy. Umbrel's watchdog then restarts
+#      it — which triggers layer 1 to self-heal.
+#
+#   3. Idempotent app installer (this file, existing behavior). If a
+#      baked-in Frappe app is missing from the site's installed apps
+#      list, install it on the fly. See the reconcile block below.
+#
+# Combined: any single cache clear, asset delete, or partial
+# migration recovers automatically on the next container restart with
+# zero manual intervention. Multiple simultaneous failures may still
+# require operator attention.
+#
+# NOTE on the "clear-cache Redis safety net": intentionally omitted.
+# Redis isn't running when this entrypoint executes (supervisord
+# starts it only after we exec), so `bench clear-cache` can't reach
+# it here, and this image already runs Redis with persistence
+# disabled (`save ""`, `dir /tmp`) — there is no dump.rdb to purge.
+# Redis cache is ephemeral and rebuilds lazily on first connect, so
+# no boot-time action is needed. Asset canary + healthcheck are the
+# real self-heal mechanisms.
+#
 # First-boot initializer for the ERPNext + Agriculture single-image
 # container. Runs BEFORE supervisord takes over.
 #
@@ -43,24 +76,51 @@ MARKER=/home/frappe/frappe-bench/sites/.site-created
 echo "[entrypoint] Fixing ownership of sites volume..."
 chown -R frappe:frappe /home/frappe/frappe-bench/sites || true
 
-# ── Restore pre-built assets from the image ───────────────────────
-# Umbrel bind-mounts sites/ so the image's built assets get hidden.
-# Dockerfile snapshots them to /var/lib/frappe-assets/ at build
-# time; here we restore into the empty mounted sites/assets/ if
-# it's missing. Uses a marker file so we don't clobber assets an
-# operator might have customized post-install.
-if [ ! -f /home/frappe/frappe-bench/sites/assets/.restored ]; then
+# ── Restore pre-built assets from the image (self-healing) ────────
+# Runs on EVERY boot, not just first. Detects three failure modes:
+#   1. Fresh volume — sites/assets/ empty or missing (first boot)
+#   2. Someone ran `clear-website-cache` — wiped the manifest but
+#      left the dir structure
+#   3. Partial migration or accidental delete — canary file gone
+#
+# The canary is `sites/assets/assets.json` — the esbuild asset
+# manifest that maps every logical bundle name (e.g.
+# "frappe-web.bundle.js") to its content-hashed file on disk. We use
+# the manifest rather than a specific bundle because Frappe v15
+# fingerprints bundle filenames (e.g. frappe-web.bundle.YEFNLNZD.js),
+# so the hash changes every build and there is no stable bundle path
+# to hardcode. assets.json, by contrast, always lives at a fixed
+# path and is exactly what gets wiped when the asset dir is cleared —
+# if it's missing, nginx serves unstyled HTML (the symptom that hit
+# Tim on 2026-07-08). Restore from /var/lib/frappe-assets/ snapshot
+# which was baked into the image at build time.
+CANARY=/home/frappe/frappe-bench/sites/assets/assets.json
+if [ ! -f "$CANARY" ] || [ ! -s "$CANARY" ]; then
+    echo "[entrypoint] Asset canary missing or empty ($CANARY) — restoring from image snapshot."
     if [ -d /var/lib/frappe-assets ]; then
-        echo "[entrypoint] Restoring pre-built assets from image snapshot..."
         mkdir -p /home/frappe/frappe-bench/sites/assets
-        cp -r /var/lib/frappe-assets/. /home/frappe/frappe-bench/sites/assets/
+        # Use cp -a to preserve symlinks/timestamps — cp -r on some
+        # implementations drops symlink metadata Frappe depends on.
+        cp -a /var/lib/frappe-assets/. /home/frappe/frappe-bench/sites/assets/
         chown -R frappe:frappe /home/frappe/frappe-bench/sites/assets
-        touch /home/frappe/frappe-bench/sites/assets/.restored
-        chown frappe:frappe /home/frappe/frappe-bench/sites/assets/.restored
-        echo "[entrypoint] Assets restored — no bench build needed at runtime."
+
+        # Verify the restore actually populated the canary — if it
+        # didn't, the snapshot is broken too and we fall through to
+        # bench build (slow but guaranteed).
+        if [ ! -f "$CANARY" ] || [ ! -s "$CANARY" ]; then
+            echo "[entrypoint] Snapshot restore failed to populate canary — falling back to bench build."
+            su frappe -s /bin/bash -c "cd /home/frappe/frappe-bench && bench build --production" \
+                || echo "[entrypoint] bench build ALSO failed — nginx will serve 404s for assets until manual intervention."
+        else
+            echo "[entrypoint] Assets restored — no bench build needed."
+        fi
     else
-        echo "[entrypoint] No asset snapshot at /var/lib/frappe-assets — first request may 404 on CSS/JS."
+        echo "[entrypoint] No snapshot at /var/lib/frappe-assets — running bench build (this is slow)."
+        su frappe -s /bin/bash -c "cd /home/frappe/frappe-bench && bench build --production" \
+            || echo "[entrypoint] bench build failed — nginx will 404 on assets."
     fi
+else
+    echo "[entrypoint] Asset canary present — no restore needed."
 fi
 
 # ── Fast path: existing site → idempotent app install, then run ───
@@ -208,8 +268,9 @@ fi
 
 # NOTE: no runtime `bench build` — assets are pre-built into
 # /var/lib/frappe-assets/ by the Dockerfile and restored to
-# sites/assets/ at the top of this entrypoint on first boot. Saves
-# 5-10 min of Pi-side compilation on every fresh install.
+# sites/assets/ by the self-healing canary check at the top of this
+# entrypoint (which re-runs on every boot). Saves 5-10 min of
+# Pi-side compilation on every fresh install.
 
 # ── Cleanup: stop inline redis so supervisord starts clean ────────
 echo "[entrypoint] Stopping inline redis..."
