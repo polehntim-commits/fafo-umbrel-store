@@ -1,1 +1,5 @@
 .DS_Store.claude/
+
+# farm_i9 is a separate git repo (github.com/polehntim-commits/farm_i9).
+# Kept here as a working copy but not tracked in fafo-umbrel-store.
+farm_i9/
