@@ -147,8 +147,11 @@ if [ -f "$MARKER" ]; then
             APP_NAME=$(basename "$APP_DIR")
             # Skip frappe itself — it's always installed as a base
             [ "$APP_NAME" = "frappe" ] && continue
-            # Only consider apps that have a proper Frappe app structure
-            [ -f "$APP_DIR/setup.py" ] || continue
+            # Only consider apps that have a proper Frappe app structure.
+            # Older apps ship setup.py; newer ones (e.g. hrms
+            # version-15) ship only pyproject.toml — accept either so
+            # the reconcile picks up hrms on existing sites too.
+            { [ -f "$APP_DIR/setup.py" ] || [ -f "$APP_DIR/pyproject.toml" ]; } || continue
             if ! echo "$INSTALLED_APPS" | grep -q "^$APP_NAME$"; then
                 echo "[entrypoint] $APP_NAME baked into image but missing on site — installing..."
                 if su frappe -s /bin/bash -c "bench --site $SITE_NAME install-app $APP_NAME"; then
@@ -265,6 +268,32 @@ if [ -d /home/frappe/frappe-bench/apps/farm_i9 ]; then
 else
     echo "[entrypoint] farm_i9 dir not present in image — running without it."
 fi
+
+# ── hrms install (Tim 2026-07-09) ─────────────────────────────────
+# Frappe HR + Payroll app baked into the image at
+# /home/frappe/frappe-bench/apps/hrms/. Install on the fresh site if
+# the app dir exists. Failure is soft — site still usable without it,
+# though Farm HR loses ~40% of its underlying framework.
+if [ -d /home/frappe/frappe-bench/apps/hrms ]; then
+    echo "[entrypoint] Installing hrms on $SITE_NAME..."
+    if su frappe -s /bin/bash -c "bench --site $SITE_NAME install-app hrms"; then
+        echo "[entrypoint] hrms installed."
+    else
+        echo "[entrypoint] hrms install-app failed — site is up without it. Install manually via UI."
+    fi
+else
+    echo "[entrypoint] hrms dir not present in image — running without it."
+fi
+
+# ── HRMS US-mode defaults ─────────────────────────────────────────
+# OMITTED (Phase 3). Frappe HR gates region-specific payroll features
+# (PF/ESI/TDS vs US) off the Company's `country` field, which is
+# per-Company in ERPNext, not per-site — so a site-level set-config
+# or a raw tabCompany UPDATE here would be fragile and easy to get
+# wrong. Tim's "Testing" Company already has country="United States"
+# from `bench new-site`, so US defaults are effectively in place. Any
+# remaining US-mode anchoring (Salary Components/Structures) is a
+# deliberate Phase 3 task handled via the Company record UI.
 
 # NOTE: no runtime `bench build` — assets are pre-built into
 # /var/lib/frappe-assets/ by the Dockerfile and restored to

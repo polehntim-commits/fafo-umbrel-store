@@ -24,6 +24,14 @@
 # Base image is `frappe/erpnext:v15.115.0` (Frappe Technologies'
 # official, has bench + all Python deps preinstalled). We just
 # layer supervisord, redis-server, and our config on top.
+#
+# Apps baked into the image (cloned at build time so they survive
+# container recreates — Umbrel bind-mounts sites/ but not apps/):
+#   * agriculture — frappe/agriculture (branch develop)
+#   * farm_i9     — polehntim-commits/farm_i9 (branch main), the
+#                   US-compliance layer (workspace: Farm HR)
+#   * hrms        — frappe/hrms (branch version-15), Frappe HR +
+#                   Payroll framework that farm_i9 rides on top of
 
 FROM frappe/erpnext:v15.115.0
 
@@ -138,6 +146,38 @@ RUN cd /home/frappe/frappe-bench && \
             || echo "[dockerfile] farm_i9 pip install failed — image ships without a runnable farm_i9"; \
      else \
         echo "[dockerfile] apps/farm_i9 dir missing — nothing to pip install"; \
+     fi)
+USER root
+
+# ── Cache-bust when frappe/hrms version-15 branch advances ────────
+# Same pattern as farm_i9 and agriculture above — GitHub's commits
+# endpoint returns the current HEAD SHA in the response body, which
+# Docker uses as a cache key. When Frappe pushes fixes to
+# version-15, Tim's next `docker build` invalidates this layer and
+# every layer below it, forcing a fresh clone + install.
+ADD https://api.github.com/repos/frappe/hrms/commits/version-15 /tmp/.hrms_head.json
+
+# ── Bake frappe/hrms into the image ───────────────────────────────
+# Frappe Technologies' official HR + Payroll app. Layers Employee,
+# Attendance, Timesheet, Leave, Salary Component/Structure/Slip,
+# Payroll Entry, Recruitment, Onboarding on top of ERPNext. Tim's
+# farm_i9 (workspace: Farm HR) rides on top of these DocTypes for
+# US-specific compliance (I-9, W-4, W-2, etc.).
+#
+# Version-15 branch matches the ERPNext v15.115.0 base image. Two-
+# step install (get-app + explicit pip install -e) matches the
+# farm_i9 and agriculture blocks — bench get-app has a silent-fail
+# pip step, so we always follow with an explicit pip install to
+# guarantee the app is importable at runtime.
+USER frappe
+RUN cd /home/frappe/frappe-bench && \
+    (bench get-app --branch version-15 hrms https://github.com/frappe/hrms.git \
+     || echo "[dockerfile] hrms get-app failed at build — will attempt pip install anyway") && \
+    (if [ -d apps/hrms ]; then \
+        env/bin/pip install -e apps/hrms --force-reinstall --no-deps \
+            || echo "[dockerfile] hrms pip install failed — image ships without a runnable hrms"; \
+     else \
+        echo "[dockerfile] apps/hrms dir missing — nothing to pip install"; \
      fi)
 USER root
 
