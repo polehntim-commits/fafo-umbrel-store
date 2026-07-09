@@ -32,6 +32,9 @@
 #                   US-compliance layer (workspace: Farm HR)
 #   * hrms        — frappe/hrms (branch version-15), Frappe HR +
 #                   Payroll framework that farm_i9 rides on top of
+#   * farm_precision_ag — polehntim-commits/farm_precision_ag (branch
+#                   main), precision-ag suite (Phase B: USDA Market
+#                   Pricing; Land/Blocks/Spray/IPM/Costing follow)
 
 FROM frappe/erpnext:v15.115.0
 
@@ -178,6 +181,28 @@ RUN cd /home/frappe/frappe-bench && \
             || echo "[dockerfile] hrms pip install failed — image ships without a runnable hrms"; \
      else \
         echo "[dockerfile] apps/hrms dir missing — nothing to pip install"; \
+     fi)
+USER root
+
+# ── Cache-bust when polehntim/farm_precision_ag main branch advances ─
+# Same pattern as farm_i9 and hrms above.
+ADD https://api.github.com/repos/polehntim-commits/farm_precision_ag/commits/main /tmp/.farm_precision_ag_head.json
+
+# ── Bake polehntim/farm_precision_ag into the image ──────────────
+# Precision agriculture Frappe app. Phase B (USDA Market Pricing)
+# is the initial feature — Land/Blocks/Implements/Spray/IPM/
+# Attestations/Costing follow in later phases. Same two-step
+# install (get-app + explicit pip install -e) as sibling apps to
+# guarantee importable at runtime.
+USER frappe
+RUN cd /home/frappe/frappe-bench && \
+    (bench get-app --branch main farm_precision_ag https://github.com/polehntim-commits/farm_precision_ag.git \
+     || echo "[dockerfile] farm_precision_ag get-app failed at build — will attempt pip install anyway") && \
+    (if [ -d apps/farm_precision_ag ]; then \
+        env/bin/pip install -e apps/farm_precision_ag --force-reinstall --no-deps \
+            || echo "[dockerfile] farm_precision_ag pip install failed — image ships without a runnable farm_precision_ag"; \
+     else \
+        echo "[dockerfile] apps/farm_precision_ag dir missing — nothing to pip install"; \
      fi)
 USER root
 

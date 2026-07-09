@@ -142,6 +142,14 @@ if [ -f "$MARKER" ]; then
     # `bench --site $SITE_NAME list-apps` returns installed apps one
     # per line. Compare against the apps present in the image dir.
     if [ -d /home/frappe/frappe-bench/apps ]; then
+        # ── Regenerate sites/apps.txt from apps/ dir ──────────────────────
+        # `bench install-app` fails with "App not in apps.txt" when the site's
+        # apps.txt is stale relative to the apps/ directory. This bit us on
+        # 2026-07-09 when hrms was baked in but apps.txt still listed only
+        # frappe/erpnext/agriculture/farm_i9. Regenerate on every boot from
+        # the actual apps dir so the two stay in sync.
+        echo "[entrypoint] Regenerating sites/apps.txt from apps/ dir..."
+        su frappe -s /bin/bash -c "ls -1 /home/frappe/frappe-bench/apps > /home/frappe/frappe-bench/sites/apps.txt"
         INSTALLED_APPS=$(su frappe -s /bin/bash -c "cd /home/frappe/frappe-bench && bench --site $SITE_NAME list-apps 2>/dev/null" | awk '{print $1}' || echo "")
         for APP_DIR in /home/frappe/frappe-bench/apps/*/; do
             APP_NAME=$(basename "$APP_DIR")
@@ -283,6 +291,21 @@ if [ -d /home/frappe/frappe-bench/apps/hrms ]; then
     fi
 else
     echo "[entrypoint] hrms dir not present in image — running without it."
+fi
+
+# ── farm_precision_ag install (Tim 2026-07-09) ────────────────────
+# Precision agriculture Frappe app baked into image at
+# /home/frappe/frappe-bench/apps/farm_precision_ag/. Install on
+# the fresh site if the app dir exists. Failure is soft.
+if [ -d /home/frappe/frappe-bench/apps/farm_precision_ag ]; then
+    echo "[entrypoint] Installing farm_precision_ag on $SITE_NAME..."
+    if su frappe -s /bin/bash -c "bench --site $SITE_NAME install-app farm_precision_ag"; then
+        echo "[entrypoint] farm_precision_ag installed."
+    else
+        echo "[entrypoint] farm_precision_ag install-app failed — site is up without it. Install manually via UI."
+    fi
+else
+    echo "[entrypoint] farm_precision_ag dir not present in image — running without it."
 fi
 
 # ── HRMS US-mode defaults ─────────────────────────────────────────
