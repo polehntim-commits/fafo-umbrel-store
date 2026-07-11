@@ -1,6 +1,6 @@
 #!/bin/bash
 # ── Self-healing strategy ─────────────────────────────────────────
-# This container has three defense layers against runtime corruption:
+# This container has four defense layers against runtime corruption:
 #
 #   1. Asset canary + snapshot restore (this file, runs every boot).
 #      Detects a missing/empty `sites/assets/` manifest and restores
@@ -17,6 +17,12 @@
 #   3. Idempotent app installer (this file, existing behavior). If a
 #      baked-in Frappe app is missing from the site's installed apps
 #      list, install it on the fly. See the reconcile block below.
+#
+#   4. Asset watchdog (supervisord). Polls sites/assets/ every 30
+#      seconds. If the canary disappears mid-runtime (from bench
+#      migrate/build/clear-cache), restores from snapshot and
+#      reloads nginx. Closes the gap between "wipe" and "container
+#      reboot" — no unstyled page for more than ~30 seconds.
 #
 # Combined: any single cache clear, asset delete, or partial
 # migration recovers automatically on the next container restart with

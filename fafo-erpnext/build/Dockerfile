@@ -9,6 +9,8 @@
 # accepts.
 #
 # Processes managed inside the container by supervisord:
+#   * asset-watchdog — polls sites/assets/ every 30s, restores from
+#                   the image snapshot if a runtime command wipes it
 #   * redis      — local, 3 logical DBs (0=cache, 1=queue, 2=socketio)
 #   * backend    — Frappe Python via gunicorn on 127.0.0.1:8000
 #   * frontend   — nginx on 0.0.0.0:8080 (Umbrel app_proxy target)
@@ -16,6 +18,11 @@
 #   * queue-short — background worker for short + default queues
 #   * queue-long  — background worker for the long queue
 #   * scheduler   — cron-like scheduler
+#
+# Nginx config drop-in (not a supervisord process):
+#   * cache-control.conf — forces no-cache/must-revalidate on HTML so
+#                   browsers never cache stale hashed-asset references;
+#                   hashed CSS/JS bundles stay long-cached + immutable
 #
 # MariaDB stays as an external `db` sidecar (persistence, upgrade
 # semantics, RAM isolation). Redis stays IN this container because
@@ -227,6 +234,19 @@ RUN if [ -d /home/frappe/frappe-bench/sites/assets ]; then \
 COPY supervisord.conf /etc/supervisor/conf.d/erpnext.conf
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
+# Asset watchdog script (see supervisord.conf entry). Restores
+# sites/assets/ if runtime commands wipe it. See design notes in
+# asset_watchdog.sh's header.
+COPY asset_watchdog.sh /usr/local/bin/asset-watchdog
+RUN chmod +x /usr/local/bin/asset-watchdog
+
+# Cache-Control header rules — force fresh HTML, long-cache hashed
+# assets. See file header for rationale. Dropped into conf.d/ so
+# nginx's default http{} block includes it (the base image's
+# nginx-entrypoint.sh generates the server{} block from a template
+# we can't easily edit, but conf.d/*.conf is included regardless).
+COPY nginx-cache-control.conf /etc/nginx/conf.d/cache-control.conf
 
 # Frontend nginx is the only externally-exposed port. Everything
 # else (backend gunicorn, websocket, redis) is localhost-only.
