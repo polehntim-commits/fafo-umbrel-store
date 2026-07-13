@@ -1,0 +1,34 @@
+manifestVersion: 1.1
+id: fafo-bank-bridge
+category: finance
+name: FAFO Bank Bridge
+version: "0.1.0"
+tagline: "Auto-sync bank transactions from Plaid into ERPNext."
+icon: https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/fafo-bank-bridge/icon.svg
+description: >-
+  Pulls bank transactions from Plaid (Wells Fargo, Columbia Bank, and any
+  Plaid-supported institution) and posts them into your ERPNext instance as
+  Bank Transaction records for reconciliation. Link each bank once through
+  Plaid Link, map its accounts to ERPNext Bank Accounts, and the app polls
+  Plaid every 6 hours — creating, updating, or cancelling ERPNext Bank
+  Transactions to match. Plaid access tokens are encrypted at rest. LAN-only
+  admin UI; no Internet exposure. Reconcile in ERPNext's built-in Bank
+  Reconciliation Tool.
+releaseNotes: >-
+  Initial pilot release. Plaid Link + OAuth flow, /transactions/sync
+  cursor-based polling, ERPNext Bank Transaction push (deposit/withdrawal
+  mapping, submit + cancel), account mapping UI, and a transaction/sync audit
+  log.
+developer: Tim Polehn
+website: ""
+dependencies: []
+repo: https://github.com/polehntim-commits/fafo-umbrel-store
+support: https://github.com/polehntim-commits/fafo-umbrel-store/issues
+port: 5202
+gallery:
+  - https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/fafo-bank-bridge/icon.svg
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+submitter: Tim Polehn
+submission: https://github.com/polehntim-commits/fafo-umbrel-store

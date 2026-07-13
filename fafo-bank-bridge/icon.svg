@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="FAFO Bank Bridge">
+  <rect width="256" height="256" rx="56" fill="#0f2a1d"/>
+  <!-- bank building -->
+  <g fill="none" stroke="#2e9e5b" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M60 108 L128 72 L196 108" fill="#16352a"/>
+    <line x1="52" y1="108" x2="204" y2="108"/>
+    <line x1="74" y1="108" x2="74" y2="170"/>
+    <line x1="110" y1="108" x2="110" y2="170"/>
+    <line x1="146" y1="108" x2="146" y2="170"/>
+    <line x1="182" y1="108" x2="182" y2="170"/>
+    <line x1="60" y1="170" x2="196" y2="170"/>
+    <rect x="52" y="184" width="152" height="14" rx="6" fill="#16352a"/>
+  </g>
+  <!-- sync arrows -->
+  <g fill="none" stroke="#7fd6a2" stroke-width="9" stroke-linecap="round">
+    <path d="M96 224 A34 34 0 0 1 96 168"/>
+    <path d="M160 168 A34 34 0 0 1 160 224"/>
+  </g>
+  <path d="M96 168 l-10 -6 m10 6 l-4 11" fill="none" stroke="#7fd6a2" stroke-width="9" stroke-linecap="round"/>
+  <path d="M160 224 l10 6 m-10 -6 l4 -11" fill="none" stroke="#7fd6a2" stroke-width="9" stroke-linecap="round"/>
+</svg>

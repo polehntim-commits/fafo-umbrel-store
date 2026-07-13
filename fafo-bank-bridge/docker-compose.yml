@@ -1,0 +1,66 @@
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: fafo-bank-bridge_server_1
+      APP_PORT: 5202
+
+  # Postgres sidecar. Named `db` (not `postgres`) because umbreld's
+  # community-app compose merger strips services outside its whitelist, and
+  # `db` is the name Umbrel's own Nextcloud app uses for its postgres sidecar —
+  # best bet for surviving the filter.
+  db:
+    image: postgres:16-alpine
+    restart: on-failure
+    stop_grace_period: 1m
+    environment:
+      POSTGRES_USER: bankbridge
+      POSTGRES_PASSWORD: "${APP_SEED}"
+      POSTGRES_DB: bankbridge
+      PGTZ: "UTC"
+    volumes:
+      - ${APP_DATA_DIR}/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bankbridge -d bankbridge"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  server:
+    image: polehntim/bank-bridge:0.1.0
+    restart: on-failure
+    stop_grace_period: 1m
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      # Direct Flask on 5202 for the admin UI + Plaid OAuth return. The OAuth
+      # redirect URI registered in Plaid must point here:
+      #   http://umbrel.local:5202/plaid/oauth_return
+      - "5202:5202"
+    environment:
+      DATA_DIR: /data
+      SECRET_KEY: "${APP_SEED}"
+      # Postgres — the compose network resolves `db` to the sidecar container.
+      DATABASE_URL: "postgresql://bankbridge:${APP_SEED}@db:5432/bankbridge"
+      # Fernet key for encrypting the stored Plaid access_tokens. Left blank on
+      # purpose: the app autogenerates a valid key on first boot and persists it
+      # to {DATA_DIR}/fernet.key on the data volume below, so it survives
+      # restarts and a data-volume restore stays decryptable. (APP_SEED is not a
+      # valid Fernet key, so it must NOT be used here.)
+      FERNET_KEY: ""
+      # Plaid + ERPNext are configured at runtime via the admin UI (persisted
+      # to the data volume). Left blank here; set only for a headless deploy.
+      PLAID_CLIENT_ID: ""
+      PLAID_SECRET: ""
+      PLAID_ENV: "sandbox"
+      PLAID_REDIRECT_URI: "http://umbrel.local:5202/plaid/oauth_return"
+      ERPNEXT_URL: "http://umbrel.local:5300"
+      ERPNEXT_API_KEY: ""
+      ERPNEXT_API_SECRET: ""
+      ERPNEXT_DEFAULT_COMPANY: ""
+      SYNC_INTERVAL_HOURS: "6"
+      GUNICORN_CMD_ARGS: "--timeout 300 --workers 2"
+    volumes:
+      - ${APP_DATA_DIR}/data/fafo-bank-bridge:/data
