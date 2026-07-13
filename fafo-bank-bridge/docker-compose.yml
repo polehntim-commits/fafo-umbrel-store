@@ -34,11 +34,6 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    ports:
-      # Direct Flask on 5202 for the admin UI + Plaid OAuth return. The OAuth
-      # redirect URI registered in Plaid must point here:
-      #   http://umbrel.local:5202/plaid/oauth_return
-      - "5202:5202"
     environment:
       DATA_DIR: /data
       SECRET_KEY: "${APP_SEED}"
