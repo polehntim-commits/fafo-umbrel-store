@@ -19,8 +19,20 @@ services:
       POSTGRES_PASSWORD: "${APP_SEED}"
       POSTGRES_DB: bankbridge
       PGTZ: "UTC"
+      # v0.3.5 — bankbridge is the SOLE superuser, so if its password ever drifts
+      # from APP_SEED nothing can reset it. The init script below creates a
+      # deterministic RESCUE superuser (bridgeadmin, password =
+      # HMAC(APP_SEED, salt)) on FIRST init so the app's boot self-heal can
+      # reconnect and repair drift. DB_RESCUE_SEED falls back to POSTGRES_PASSWORD
+      # (= APP_SEED) inside the script. Keep in sync with the server's DB_RESCUE_*.
+      DB_RESCUE_USER: bridgeadmin
+      DB_RESCUE_SALT: bankbridge-rescue-v1
     volumes:
       - ${APP_DATA_DIR}/postgres:/var/lib/postgresql/data
+      # Runs ONCE on a fresh volume — creates the bridgeadmin rescue superuser.
+      # NOTE: verify this bind survives umbreld's compose merge on a real install
+      # (see the `db`-naming comment above); the file ships in the app dir.
+      - ./initdb.d:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U bankbridge -d bankbridge"]
       interval: 5s
@@ -57,5 +69,11 @@ services:
       ERPNEXT_DEFAULT_COMPANY: ""
       SYNC_INTERVAL_HOURS: "6"
       GUNICORN_CMD_ARGS: "--timeout 300 --workers 2"
+      # v0.3.5 — boot self-heal of app-role password drift. Must match the db
+      # service's DB_RESCUE_* so the app re-derives the same bridgeadmin password.
+      # DB_RESCUE_SEED defaults (config.py) to SECRET_KEY (= APP_SEED) here.
+      AUTO_RECOVER_DB_AUTH: "true"
+      DB_RESCUE_USER: bridgeadmin
+      DB_RESCUE_SALT: bankbridge-rescue-v1
     volumes:
       - ${APP_DATA_DIR}/data/fafo-bank-bridge:/data
