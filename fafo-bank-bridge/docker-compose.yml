@@ -6,11 +6,14 @@ services:
       APP_HOST: fafo-bank-bridge_server_1
       APP_PORT: 5202
 
-  # Postgres sidecar. Named `db` (not `postgres`) because umbreld's
-  # community-app compose merger strips services outside its whitelist, and
-  # `db` is the name Umbrel's own Nextcloud app uses for its postgres sidecar —
-  # best bet for surviving the filter.
-  db:
+  # Postgres sidecar. v0.4.16: renamed from `db` → `bankbridge-db` to prevent
+  # Docker network alias collisions with other Umbrel apps' postgres sidecars
+  # (BucketLog, ERPNext, etc. all use `db` too). See app-name-prefix convention
+  # in Foundational Design Principles + `/bankbridge/*` path prefix precedent.
+  # Original `db` name comment retained for archive: umbreld's community-app
+  # compose merger historically stripped services outside its whitelist and
+  # `db` was the safest bet — but the collision cost outweighed that safety.
+  bankbridge-db:
     image: postgres:16-alpine
     restart: on-failure
     stop_grace_period: 1m
@@ -44,13 +47,14 @@ services:
     restart: on-failure
     stop_grace_period: 1m
     depends_on:
-      db:
+      bankbridge-db:
         condition: service_healthy
     environment:
       DATA_DIR: /data
       SECRET_KEY: "${APP_SEED}"
-      # Postgres — the compose network resolves `db` to the sidecar container.
-      DATABASE_URL: "postgresql://bankbridge:${APP_SEED}@db:5432/bankbridge"
+      # Postgres — v0.4.16: renamed from `db` → `bankbridge-db` to avoid Docker
+      # network alias collisions with other Umbrel apps' postgres sidecars.
+      DATABASE_URL: "postgresql://bankbridge:${APP_SEED}@bankbridge-db:5432/bankbridge"
       # Fernet key for encrypting the stored Plaid access_tokens. Left blank on
       # purpose: the app autogenerates a valid key on first boot and persists it
       # to {DATA_DIR}/fernet.key on the data volume below, so it survives
@@ -62,7 +66,7 @@ services:
       PLAID_CLIENT_ID: ""
       PLAID_SECRET: ""
       PLAID_ENV: "sandbox"
-      PLAID_REDIRECT_URI: "http://umbrel.local:5202/plaid/oauth_return"
+      PLAID_REDIRECT_URI: "http://umbrel.local:5202/bankbridge/plaid/oauth_return"
       ERPNEXT_URL: "http://umbrel.local:5300"
       ERPNEXT_API_KEY: ""
       ERPNEXT_API_SECRET: ""
