@@ -6,11 +6,16 @@ services:
       APP_HOST: fafo-bucketlog_server_1
       APP_PORT: 5200
 
-  # Postgres sidecar. Named `db` (not `postgres`) because umbreld's
-  # community-app compose merger strips services outside its
-  # whitelist, and `db` is the name Umbrel's own Nextcloud app uses
-  # for its postgres sidecar — best bet for surviving the filter.
-  db:
+  # Postgres sidecar. Renamed from `db` → `bucketlog-db` to prevent
+  # Docker network alias collisions with other Umbrel apps' postgres
+  # sidecars (Bank Bridge, ERPNext, Nextcloud all name theirs `db` too
+  # by default — they share one Docker network on Umbrel, so a bare
+  # `db` alias resolves to ALL of them and libpq picks a random address
+  # to try; a password rejection on the wrong container is fatal, and
+  # Bank Bridge v0.4.16 spent five releases chasing this before naming
+  # the alias). Following the app-name-prefix convention from Bank
+  # Bridge's docker-compose.yml.
+  bucketlog-db:
     image: postgres:16-alpine
     restart: on-failure
     stop_grace_period: 1m
@@ -33,7 +38,7 @@ services:
     restart: on-failure
     stop_grace_period: 1m
     depends_on:
-      db:
+      bucketlog-db:
         condition: service_healthy
     ports:
       # Direct Flask on 5201 — bypasses the Umbrel app_proxy which
@@ -45,14 +50,19 @@ services:
       SECRET_KEY: "${APP_SEED}"
       BOOTSTRAP_API_KEY: "${APP_SEED}"
       NIP98_CLOCK_SKEW_SECONDS: "120"
-      # PostgreSQL — the compose network resolves `db` to the sidecar
-      # container. MVCC eliminates the SQLite lock storms Volume
-      # Vision hits under concurrent relay + sync writes.
-      DATABASE_URL: "postgresql://bucketlog:${APP_SEED}@db:5432/bucketlog"
+      # PostgreSQL — the compose network resolves `bucketlog-db` to
+      # the sidecar container. Renamed from `db` to `bucketlog-db` per
+      # the app-name-prefix convention so we don't collide with other
+      # Umbrel apps' postgres aliases (see the sidecar service comment
+      # above). MVCC eliminates the SQLite lock storms Volume Vision
+      # hits under concurrent relay + sync writes.
+      DATABASE_URL: "postgresql://bucketlog:${APP_SEED}@bucketlog-db:5432/bucketlog"
       RELAY_LIST: "wss://relay.damus.io,wss://nos.lol"
       SUBSCRIBER_ENABLED: "true"
-      # Outbound Tor SOCKS5 proxy — used by the Nostr relay subscriber
-      # and any peer-federation push paths to reach .onion services.
+      # Outbound Tor SOCKS5 proxy — used ONLY by the Nostr relay
+      # subscriber to reach .onion relays. NOT used for iOS API
+      # sync; iOS uses HTTP on LAN and Nostr for cross-network per
+      # the Volume Vision project's architecture (Tor-free client).
       # Umbrel provides `tor_proxy:9050` on umbrel_main_network.
       TOR_SOCKS_HOST: tor_proxy
       TOR_SOCKS_PORT: "9050"
