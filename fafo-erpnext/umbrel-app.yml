@@ -1,22 +1,36 @@
 manifestVersion: 1.1
 id: fafo-erpnext
 category: business
-name: ERPNext + Agriculture
-version: "15.0.0"
-tagline: "Full-stack ERP with the Agriculture domain preinstalled."
+name: ERPNext + Agriculture + Farm HR + Precision Ag
+version: "15.1.0"
+tagline: "Full-stack farm ERP: books, HR, precision ag, USDA pricing, and MCP for AI agents."
 icon: https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/fafo-erpnext/icon.png
 description: >-
   ERPNext v15 (the open-source ERP built on the Frappe framework)
-  running on the Umbrel with the Agriculture domain app
+  running on the Umbrel with a curated farm-management app stack
   auto-installed on first boot.
 
   ERPNext handles the business ledger — sales orders, purchase orders,
-  accounting, HR/payroll, inventory, invoicing. The Agriculture module
-  adds DocTypes for Crop, Land Unit, Crop Cycle, Disease, Fertilizer,
-  Water Analysis, Soil Analysis, and Weather. Together they give you
-  a working baseline farm ERP that you can extend by installing custom
-  Frappe apps (e.g. cherry-industry piece rate, block-level cost
-  tracking, harvest attestations) alongside.
+  accounting, inventory, invoicing. Frappe HR (hrms) layers Employee,
+  Attendance, Timesheet, Leave, Salary Component/Structure/Slip, and
+  Payroll Entry on top. The Agriculture module adds DocTypes for Crop,
+  Land Unit, Crop Cycle, Disease, Fertilizer, Water Analysis, Soil
+  Analysis, and Weather.
+
+  Two Polehn-Farm custom apps ride on top:
+    • farm_i9 (workspace: Farm HR) — US I-9 employment eligibility,
+      W-4 withholding, per-company compliance policy.
+    • farm_precision_ag — USDA Market Pricing (Phase B), with
+      Land/Blocks/Implements/Spray/IPM/Attestations/Costing in later
+      phases.
+
+  A fifth app, erpnext_mcp, exposes an MCP (Model Context Protocol)
+  HTTP+SSE endpoint so AI agents (Claude Desktop, Claude Code) can
+  read GL entries, journal entries, bank transactions, fiscal years,
+  and the chart of accounts, with per-tool kill switches for the five
+  mutating tools (all default OFF). The MCP endpoint is inert until
+  an operator opens /app/erpnext-mcp-settings, generates a bearer
+  token, and ticks Enabled — install ships zero attack surface.
 
   First boot takes 5-10 minutes while the site is created and the
   apps are installed. Default admin user is `Administrator`, password
@@ -24,7 +38,8 @@ description: >-
   app credentials screen).
 website: "https://frappe.io/erpnext"
 dependencies: []
-repo: https://github.com/frappe/erpnext,https://github.com/frappe/agriculture
+repo: >-
+  https://github.com/frappe/erpnext,https://github.com/frappe/agriculture,https://github.com/frappe/hrms,https://github.com/polehntim-commits/farm_i9,https://github.com/polehntim-commits/farm_precision_ag,https://github.com/polehntim-commits/erpnext_mcp
 support: https://github.com/polehntim-commits/fafo-umbrel-store/issues
 port: 5300
 gallery: []

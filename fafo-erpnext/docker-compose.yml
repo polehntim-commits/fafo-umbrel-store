@@ -1,22 +1,36 @@
 version: "3.7"
 
-# ERPNext v15 + Agriculture module for Umbrel.
+# ERPNext v15 + Agriculture + Farm HR + Precision Ag + MCP for Umbrel.
 #
 # Uses the classic Umbrel community-app pattern:
-#   app_proxy → routes public requests to the server container
-#   db        → MariaDB 10.6 sidecar (persistence, upgrade separately)
-#   server    → single polehntim/erpnext-umbrel:15 image containing
-#               all Frappe processes managed by supervisord (backend,
-#               frontend/nginx, websocket, workers, scheduler, redis)
+#   app_proxy  → routes public requests to the server container
+#   erpnext-db → MariaDB 10.6 sidecar (persistence, upgrade separately)
+#   server     → single polehntim/erpnext-umbrel:15 image containing
+#                all Frappe processes managed by supervisord (backend,
+#                frontend/nginx, websocket, workers, scheduler, redis)
 #
-# This shape matches what BucketLog uses and what Umbrel's community-
-# app compose merger reliably accepts. The previous 10-service
-# compose was stripped down to zero services because Umbrel silently
-# drops names outside its whitelist.
+# This shape matches what BucketLog and Bank Bridge use and what
+# Umbrel's community-app compose merger reliably accepts.
+#
+# v15.1.0: renamed sidecar `db` → `erpnext-db` for parity with
+# `bankbridge-db` and `bucketlog-db`. When multiple community apps
+# each named their postgres/mariadb sidecar plainly `db`, the shared
+# Umbrel Docker network ended up with three conflicting `db` DNS
+# aliases. App-prefixed names eliminate the collision. The host
+# bind-mount path `${APP_DATA_DIR}/db` is preserved so existing
+# MariaDB data survives the rename in place.
+#
+# Baked into the image (see fafo-erpnext/build/Dockerfile):
+#   * frappe/agriculture       — Crop, Land Unit, Crop Cycle DocTypes
+#   * frappe/hrms              — Employee, Payroll, Leave, Attendance
+#   * polehntim/farm_i9        — US I-9/W-4 compliance (workspace: Farm HR)
+#   * polehntim/farm_precision_ag — USDA pricing, Land/Blocks/Spray/IPM
+#   * polehntim/erpnext_mcp    — MCP server for AI-agent access (inert until
+#                                token generated at /app/erpnext-mcp-settings)
 #
 # First boot takes 5-10 minutes while the server container's
-# `entrypoint.sh` creates the site + installs erpnext + tries to
-# install agriculture. Watch: `docker logs -f fafo-erpnext_server_1`.
+# `entrypoint.sh` creates the site + installs erpnext + reconciles
+# every baked-in app. Watch: `docker logs -f fafo-erpnext_server_1`.
 
 services:
   app_proxy:
@@ -25,7 +39,7 @@ services:
       APP_PORT: 8080
       PROXY_AUTH_ADD: "false"
 
-  db:
+  erpnext-db:
     image: mariadb:10.6
     restart: on-failure
     stop_grace_period: 1m
@@ -37,6 +51,9 @@ services:
     environment:
       MYSQL_ROOT_PASSWORD: "${APP_SEED}"
     volumes:
+      # Host path kept as ${APP_DATA_DIR}/db (unchanged) so the
+      # rename doesn't create a fresh empty volume — existing data
+      # continues to live at ~/umbrel/app-data/fafo-erpnext/db.
       - ${APP_DATA_DIR}/db:/var/lib/mysql
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost",
@@ -51,11 +68,15 @@ services:
     restart: on-failure
     stop_grace_period: 2m
     depends_on:
-      db:
+      erpnext-db:
         condition: service_healthy
     environment:
       SITE_NAME: frontend
-      DB_HOST: fafo-erpnext_db_1
+      # v15.1.0: use service-name DNS resolution (`erpnext-db`) rather
+      # than the fully-qualified container name (`fafo-erpnext_db_1`).
+      # Matches Bank Bridge's DATABASE_URL pattern and survives compose
+      # project-name changes.
+      DB_HOST: erpnext-db
       DB_PORT: "3306"
       DB_ROOT_PASS: "${APP_SEED}"
       ADMIN_PASS: "${APP_PASSWORD}"

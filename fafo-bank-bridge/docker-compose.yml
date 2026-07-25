@@ -5,6 +5,13 @@ services:
     environment:
       APP_HOST: fafo-bank-bridge_server_1
       APP_PORT: 5202
+      # v0.6.0 — disable Umbrel dashboard SSO on the app_proxy so the /mcp
+      # endpoint is reachable by AI clients that carry their own bearer token
+      # (see BB_MCP_AUTH_TOKEN below). The Flask session gate still protects
+      # /admin/* with a per-Bank-Bridge username+password. Every other path
+      # is either bearer-token-gated (/mcp), Plaid-webhook-signed (/plaid/*),
+      # or read-only public status pages by design.
+      PROXY_AUTH_ADD: "false"
 
   # Postgres sidecar. v0.4.16: renamed from `db` → `bankbridge-db` to prevent
   # Docker network alias collisions with other Umbrel apps' postgres sidecars
@@ -43,7 +50,13 @@ services:
       retries: 20
 
   server:
-    image: polehntim/bank-bridge:0.1.0
+    # Pinned tag — bump on release, don't use floating `:latest` so Umbrel
+    # deploys are reproducible and easy to roll back.
+    #   0.1.0  first cut
+    #   0.4.x  Plaid statements + Postgres rescue + reconciliation ledger
+    #   0.5.x  investment JE posting + advisory + opening-balance backdating
+    #   0.6.0  MCP server (14 tools, per-tool kill switches, audit log)
+    image: polehntim/bank-bridge:0.6.0
     restart: on-failure
     stop_grace_period: 1m
     depends_on:
@@ -52,6 +65,14 @@ services:
     environment:
       DATA_DIR: /data
       SECRET_KEY: "${APP_SEED}"
+      # v0.6.0 — MCP server bearer token. Empty string keeps /mcp inert
+      # (404 on any request). Reusing APP_SEED is defensible because the
+      # MCP token sits at the same trust tier as SECRET_KEY and the DB
+      # password (all live on the app-data volume, all rotate together
+      # when APP_SEED rotates). Per-tool kill switches at /admin/mcp
+      # remain the second gate — mutating tools default OFF regardless
+      # of this being set.
+      BB_MCP_AUTH_TOKEN: "${APP_SEED}"
       # Postgres — v0.4.16: renamed from `db` → `bankbridge-db` to avoid Docker
       # network alias collisions with other Umbrel apps' postgres sidecars.
       DATABASE_URL: "postgresql://bankbridge:${APP_SEED}@bankbridge-db:5432/bankbridge"
