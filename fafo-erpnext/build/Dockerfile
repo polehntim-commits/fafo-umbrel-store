@@ -213,6 +213,39 @@ RUN cd /home/frappe/frappe-bench && \
      fi)
 USER root
 
+# ── Cache-bust when polehntim/erpnext_mcp main branch advances ────
+# Same pattern as farm_i9, hrms, farm_precision_ag above.
+ADD https://api.github.com/repos/polehntim-commits/erpnext_mcp/commits/main /tmp/.erpnext_mcp_head.json
+
+# ── Bake polehntim/erpnext_mcp into the image ─────────────────────
+# MCP (Model Context Protocol) server exposed as a Frappe custom
+# app. Ships a bearer-token HTTP+SSE endpoint plus two doctypes:
+#   * ERPNext MCP Settings (Single) — token, CIDR allowlist, per-
+#                                     tool kill switches (mutating
+#                                     tools default OFF, read tools
+#                                     default ON, master `enabled`
+#                                     default OFF — install is inert)
+#   * MCP Action Log — append-only audit trail of every call
+# The entrypoint's reconcile loop (line ~140) picks this up and
+# runs `bench install-app erpnext_mcp` on both fresh sites and
+# existing sites — no entrypoint change needed.
+#
+# After first boot, an operator opens /app/erpnext-mcp-settings,
+# generates a token, ticks Enabled, saves. Until then the endpoint
+# returns 404. Same two-step install (get-app + explicit pip
+# install -e) as sibling apps to guarantee importable at runtime.
+USER frappe
+RUN cd /home/frappe/frappe-bench && \
+    (bench get-app --branch main erpnext_mcp https://github.com/polehntim-commits/erpnext_mcp.git \
+     || echo "[dockerfile] erpnext_mcp get-app failed at build — will attempt pip install anyway") && \
+    (if [ -d apps/erpnext_mcp ]; then \
+        env/bin/pip install -e apps/erpnext_mcp --force-reinstall --no-deps \
+            || echo "[dockerfile] erpnext_mcp pip install failed — image ships without a runnable erpnext_mcp"; \
+     else \
+        echo "[dockerfile] apps/erpnext_mcp dir missing — nothing to pip install"; \
+     fi)
+USER root
+
 # ── Pre-build all app assets AND cache them for restore ───────────
 # `bench build` compiles CSS + JS bundles for every installed app
 # into `sites/assets/`. On first boot Umbrel's bind-mount hides that
