@@ -56,7 +56,7 @@ services:
     #   0.4.x  Plaid statements + Postgres rescue + reconciliation ledger
     #   0.5.x  investment JE posting + advisory + opening-balance backdating
     #   0.6.0  MCP server (14 tools, per-tool kill switches, audit log)
-    image: polehntim/bank-bridge:0.6.0
+    image: polehntim/bank-bridge:0.7.0
     restart: on-failure
     stop_grace_period: 1m
     depends_on:
