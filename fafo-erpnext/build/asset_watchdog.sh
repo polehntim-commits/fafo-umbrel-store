@@ -1,68 +1,81 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
 # ── Asset watchdog ────────────────────────────────────────────────
-# Polls sites/assets/ every WATCHDOG_INTERVAL seconds. When the
-# canary (assets.json) is missing or empty, restores the entire
-# assets tree from the image snapshot at /var/lib/frappe-assets/
-# and reloads nginx.
+# Polls the asset floor every WATCHDOG_INTERVAL seconds and repairs it
+# when it breaks mid-container-lifetime — closing the gap where a
+# runtime `bench migrate` / `bench build` / `bench clear-website-cache`
+# leaves nginx serving unstyled pages until manual intervention.
 #
-# Runs under supervisord as a top-priority process (starts before
-# nginx) so any runtime-triggered asset wipe recovers within 30
-# seconds instead of requiring container force-recreate.
+# v15.1.2: the check moved out of this script into asset_floor.py, which
+# both this loop and entrypoint.sh now share. The old version tested one
+# thing — is `sites/assets/assets.json` present and non-empty — and that
+# is exactly the check that missed the 2026-07-26 incident: the manifest
+# was present, non-empty, and *stale*, naming content-hashed bundle files
+# from a previous image build that no longer existed on disk. Every CSS
+# URL in the served HTML 404'd while this watchdog reported everything
+# fine. See asset_floor.py's docstring for the full mechanism.
 #
-# Log entries prefixed with [watchdog] so they're greppable in
-# `docker logs`.
+# What the shared checker validates now:
+#   1. assets.json present, non-empty, parses  (the old canary, subsumed)
+#   2. every path it names actually resolves on disk  (the stale case)
+#   3. every app shipping public/ or www/ has its sites/assets/ entry
+#
+# and repairs via snapshot restore → rate-limited bench build.
+#
+# This loop passes --clear-cache because it runs mid-lifetime with Redis
+# up, and Frappe caches the parsed manifest there: without dropping it,
+# workers keep emitting the old bundle URLs after the files are fixed.
+# (entrypoint.sh does NOT pass it — Redis is not started yet at boot, and
+# this image runs Redis with persistence off, so the cache is empty.)
+#
+# --quiet-when-healthy keeps the steady state silent; a 30s loop that
+# logged on every pass would bury the lines that matter.
+#
+# Log entries prefixed with [watchdog] / [asset-floor] so they're
+# greppable in `docker logs`.
 #
 # Env inputs:
 #   WATCHDOG_INTERVAL — poll interval in seconds (default 30)
+#   ASSET_BUILD_MIN_INTERVAL — min seconds between `bench build` attempts
+#                     (default 3600). Guards against a persistently broken
+#                     tree turning a 30s loop into a rebuild storm.
 
 set -o pipefail
 
 INTERVAL="${WATCHDOG_INTERVAL:-30}"
-ASSETS_DIR=/home/frappe/frappe-bench/sites/assets
-SNAPSHOT_DIR=/var/lib/frappe-assets
-CANARY="$ASSETS_DIR/assets.json"
+BUILD_MIN_INTERVAL="${ASSET_BUILD_MIN_INTERVAL:-3600}"
+FLOOR=/usr/local/bin/asset-floor
+BENCH_PY=/home/frappe/frappe-bench/env/bin/python
 
 echo "[watchdog] Starting asset watchdog (interval=${INTERVAL}s)."
-echo "[watchdog] Monitoring canary: $CANARY"
-echo "[watchdog] Snapshot source: $SNAPSHOT_DIR"
+echo "[watchdog] Floor checker: $FLOOR (build min interval=${BUILD_MIN_INTERVAL}s)"
 
-# Small initial grace period so entrypoint's first-boot restore has
-# time to complete before we start polling.
+if [ ! -f "$FLOOR" ]; then
+    echo "[watchdog] ERROR: $FLOOR not found — this image is built wrong. Watchdog idling; assets will NOT self-heal at runtime."
+    while true; do sleep 3600; done
+fi
+
+# Prefer the bench venv interpreter for consistency with the entrypoint,
+# but the floor checker uses only the stdlib, so system python3 is a fine
+# fallback if the venv is ever missing.
+PY="$BENCH_PY"
+[ -x "$PY" ] || PY=$(command -v python3)
+if [ -z "$PY" ]; then
+    echo "[watchdog] ERROR: no python3 interpreter found — watchdog idling."
+    while true; do sleep 3600; done
+fi
+
+# Small initial grace period so the entrypoint's own floor check has
+# finished before we start polling.
 sleep "$INTERVAL"
 
 while true; do
-    # Canary missing OR zero-byte
-    if [ ! -f "$CANARY" ] || [ ! -s "$CANARY" ]; then
-        echo "[watchdog] $(date -u +%Y-%m-%dT%H:%M:%SZ) Canary missing/empty at $CANARY — triggering restore."
-
-        if [ ! -d "$SNAPSHOT_DIR" ]; then
-            echo "[watchdog] ERROR: No snapshot at $SNAPSHOT_DIR — cannot restore. Container needs rebuild."
-            sleep "$INTERVAL"
-            continue
-        fi
-
-        # Restore (cp -a preserves symlinks/timestamps like the
-        # entrypoint's own restore path)
-        mkdir -p "$ASSETS_DIR"
-        if cp -a "$SNAPSHOT_DIR/." "$ASSETS_DIR/"; then
-            chown -R frappe:frappe "$ASSETS_DIR"
-            echo "[watchdog] Assets restored from snapshot."
-        else
-            echo "[watchdog] ERROR: cp failed during restore."
-            sleep "$INTERVAL"
-            continue
-        fi
-
-        # Restart nginx so it re-opens FDs on the freshly restored
-        # files. supervisorctl talks to the parent supervisord over
-        # its unix socket.
-        if supervisorctl restart frontend > /dev/null 2>&1; then
-            echo "[watchdog] nginx (frontend) restarted."
-        else
-            echo "[watchdog] WARN: supervisorctl restart frontend failed — nginx may still serve 404 for hashed bundles until manual restart."
-        fi
-
-        echo "[watchdog] Recovery complete."
+    if ! "$PY" "$FLOOR" \
+            --clear-cache \
+            --reload-nginx \
+            --quiet-when-healthy \
+            --build-min-interval "$BUILD_MIN_INTERVAL"; then
+        echo "[watchdog] $(date -u +%Y-%m-%dT%H:%M:%SZ) Asset floor still failing after repair attempt — see [asset-floor] lines above."
     fi
     sleep "$INTERVAL"
 done

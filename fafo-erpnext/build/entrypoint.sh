@@ -4,12 +4,24 @@
 # ── Self-healing strategy ─────────────────────────────────────────
 # This container has four defense layers against runtime corruption:
 #
-#   1. Asset canary + snapshot restore (this file, runs every boot).
-#      Detects a missing/empty `sites/assets/` manifest and restores
-#      it from the image's `/var/lib/frappe-assets/` snapshot without
-#      a full bench build. Handles the most common failure mode
-#      (someone ran `bench clear-website-cache` and killed nginx's
-#      asset manifest — the incident that hit Tim on 2026-07-08).
+#   1. Asset floor check + snapshot restore (this file + asset_floor.py,
+#      runs every boot, twice: before and after the app reconcile).
+#      v15.1.2 widened this from the original canary. It now validates
+#      that `sites/assets/assets.json` parses AND that every path it
+#      names actually resolves on disk, plus that each app shipping
+#      `public/`/`www/` has its `sites/assets/` entry. Repairs from the
+#      image's `/var/lib/frappe-assets/` snapshot without a full bench
+#      build, falling back to a rate-limited build.
+#
+#      The original canary (present + non-empty) covered the 2026-07-08
+#      incident — someone ran `bench clear-website-cache` and wiped the
+#      manifest. It did NOT cover 2026-07-26: the manifest was present,
+#      non-empty, and stale, naming bundle hashes from the previous image
+#      build. Bundles live in the image (`apps/<app>/<app>/public/dist/`)
+#      behind per-app symlinks; assets.json lives in the bind-mounted
+#      volume and survives the recreate that changes every hash. Result:
+#      404 on every CSS/JS URL, raw unstyled HTML, and a canary that
+#      reported healthy throughout.
 #
 #   2. Docker HEALTHCHECK (Dockerfile). If nginx returns 404/500 for
 #      the manifest URL for 90s+ (30s interval × 3 retries), Docker
@@ -20,11 +32,15 @@
 #      baked-in Frappe app is missing from the site's installed apps
 #      list, install it on the fly. See the reconcile block below.
 #
-#   4. Asset watchdog (supervisord). Polls sites/assets/ every 30
-#      seconds. If the canary disappears mid-runtime (from bench
-#      migrate/build/clear-cache), restores from snapshot and
-#      reloads nginx. Closes the gap between "wipe" and "container
-#      reboot" — no unstyled page for more than ~30 seconds.
+#   4. Asset watchdog (supervisord). Runs the SAME asset_floor.py check
+#      every 30 seconds. If the floor breaks mid-runtime (from bench
+#      migrate/build/clear-cache), restores from snapshot, drops
+#      Frappe's cached copy of the manifest, and reloads nginx. Closes
+#      the gap between "wipe" and "container reboot" — no unstyled page
+#      for more than ~30 seconds. Unlike the boot-time call it passes
+#      --clear-cache, because Redis IS up mid-lifetime and Frappe caches
+#      the parsed manifest there; without dropping it, workers keep
+#      emitting the old bundle URLs after the files are fixed.
 #
 #   5. DB grant self-heal (v15.1.2, this file + db_grant_selfheal.py,
 #      runs every boot). `bench new-site` pins the site's MariaDB user
@@ -186,34 +202,45 @@ chown -R frappe:frappe /home/frappe/frappe-bench/sites || true
 # if it's missing, nginx serves unstyled HTML (the symptom that hit
 # Tim on 2026-07-08). Restore from /var/lib/frappe-assets/ snapshot
 # which was baked into the image at build time.
-CANARY=/home/frappe/frappe-bench/sites/assets/assets.json
-if [ ! -f "$CANARY" ] || [ ! -s "$CANARY" ]; then
-    echo "[entrypoint] Asset canary missing or empty ($CANARY) — restoring from image snapshot."
-    if [ -d /var/lib/frappe-assets ]; then
-        mkdir -p /home/frappe/frappe-bench/sites/assets
-        # Use cp -a to preserve symlinks/timestamps — cp -r on some
-        # implementations drops symlink metadata Frappe depends on.
-        cp -a /var/lib/frappe-assets/. /home/frappe/frappe-bench/sites/assets/
-        chown -R frappe:frappe /home/frappe/frappe-bench/sites/assets
-
-        # Verify the restore actually populated the canary — if it
-        # didn't, the snapshot is broken too and we fall through to
-        # bench build (slow but guaranteed).
-        if [ ! -f "$CANARY" ] || [ ! -s "$CANARY" ]; then
-            echo "[entrypoint] Snapshot restore failed to populate canary — falling back to bench build."
-            su frappe -s /bin/bash -c "cd /home/frappe/frappe-bench && bench build --production" \
-                || echo "[entrypoint] bench build ALSO failed — nginx will serve 404s for assets until manual intervention."
-        else
-            echo "[entrypoint] Assets restored — no bench build needed."
-        fi
-    else
-        echo "[entrypoint] No snapshot at /var/lib/frappe-assets — running bench build (this is slow)."
-        su frappe -s /bin/bash -c "cd /home/frappe/frappe-bench && bench build --production" \
-            || echo "[entrypoint] bench build failed — nginx will 404 on assets."
+#
+# v15.1.2 — the canary alone was NOT enough. It tests one thing: is
+# `assets.json` present and non-empty. On 2026-07-26 the manifest was
+# present, non-empty, and STALE — it named content-hashed bundle files
+# from the previous image build that no longer existed on disk, so every
+# CSS/JS URL in the served HTML 404'd and the site rendered as raw
+# unstyled HTML while this check reported everything fine. The compiled
+# bundles live in the IMAGE (apps/<app>/<app>/public/dist/), reached via
+# per-app symlinks, while assets.json lives in the bind-mounted VOLUME
+# and survives the recreate that changed all the hashes.
+#
+# So the check is now referential integrity, not presence, and lives in
+# the shared asset_floor.py (also used by the runtime watchdog). It
+# validates: manifest parses; every path it names resolves on disk; every
+# app shipping public/ or www/ has its sites/assets/ entry. Repairs via
+# snapshot restore, falling back to a rate-limited bench build. See that
+# file's docstring for the full mechanism.
+#
+# No --clear-cache here: supervisord has not started Redis yet, and this
+# image runs Redis with persistence disabled, so a boot-time repair always
+# meets an empty cache. The watchdog passes it; we don't need to.
+asset_floor_check() {
+    local when="$1"
+    echo "[entrypoint] ── Asset floor check ($when) ──"
+    if [ ! -f /usr/local/bin/asset-floor ]; then
+        echo "[entrypoint] WARNING: /usr/local/bin/asset-floor missing — skipping asset floor check. Site may render unstyled."
+        return 0
     fi
-else
-    echo "[entrypoint] Asset canary present — no restore needed."
-fi
+    local py="$BENCH_PY"
+    [ -x "$py" ] || py=$(command -v python3)
+    if [ -z "$py" ]; then
+        echo "[entrypoint] WARNING: no python3 available — skipping asset floor check."
+        return 0
+    fi
+    "$py" /usr/local/bin/asset-floor \
+        || echo "[entrypoint] WARNING: asset floor could not be repaired (see [asset-floor] lines above). Continuing boot — the site may render unstyled until fixed."
+}
+
+asset_floor_check "pre-app-reconcile"
 
 # ── DB grant self-heal (v15.1.2) ──────────────────────────────────
 # Runs on EVERY boot, and deliberately BEFORE the marker fast-path
@@ -298,6 +325,12 @@ if [ -f "$MARKER" ]; then
             fi
         done
     fi
+
+    # Re-check the floor AFTER the app reconcile. `bench install-app` runs
+    # the app's migrations and can touch the asset tree, so the state that
+    # matters is the one supervisord is about to serve — not the one we saw
+    # before the installs ran. Cheap when healthy (a few dozen stat calls).
+    asset_floor_check "post-app-reconcile"
 
     echo "[entrypoint] App check complete, starting supervisord."
     exec "$@"
@@ -571,6 +604,11 @@ cat <<BANNER || true
     sudo cat ~/umbrel/app-data/fafo-erpnext/sites/.admin-password-initial.txt
 ================================================================================
 BANNER
+
+# Final floor check — the app installs above each ran migrations that can
+# touch the asset tree. Same rationale as the fast path's post-reconcile
+# check: validate what supervisord is about to serve.
+asset_floor_check "post-first-boot-installs"
 
 echo "[entrypoint] First-boot setup complete. Starting supervisord."
 exec "$@"

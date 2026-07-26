@@ -283,10 +283,19 @@ RUN chmod +x /entrypoint.sh
 COPY db_grant_selfheal.py /usr/local/bin/db-grant-selfheal
 RUN chmod +x /usr/local/bin/db-grant-selfheal
 
+# Asset floor check (v15.1.2). Shared by entrypoint.sh (boot) and
+# asset-watchdog (every 30s at runtime). Validates that assets.json's
+# entries actually resolve on disk — the stale-manifest case that the
+# old present-and-non-empty canary could not see — and repairs from the
+# /var/lib/frappe-assets snapshot. Stdlib only, so it runs under either
+# the bench venv interpreter or the system python3.
+COPY asset_floor.py /usr/local/bin/asset-floor
+RUN chmod +x /usr/local/bin/asset-floor
+
 # Authoritative self-heal inventory (overrides the same keys set near the top
 # of this file). Placed down here so bumping it re-runs only the last few
 # cheap layers instead of the whole app-clone + bench-build chain.
-LABEL org.polehnfarm.self-heal="asset-canary,healthcheck,app-reconcile,db-grant"
+LABEL org.polehnfarm.self-heal="asset-floor,healthcheck,app-reconcile,db-grant"
 LABEL org.polehnfarm.self-heal.version="2"
 
 # Asset watchdog script (see supervisord.conf entry). Restores
@@ -327,6 +336,15 @@ VOLUME ["/home/frappe/frappe-bench/sites"]
 # base frappe/erpnext:v15.115.0 image (no apt install needed). Grace
 # period of 5 min accommodates cold-boot bench new-site +
 # agriculture/farm_i9 install.
+#
+# v15.1.2 NOTE — deliberately NOT extended to the full asset floor check.
+# Running `asset-floor --check-only` here would catch the stale-manifest
+# case, but it would also report unhealthy for the entire 5-10 minutes the
+# watchdog spends inside `bench build --production`. At 30s × 3 retries
+# Umbrel would restart the container mid-build, every time, turning a
+# recoverable state into a loop. The floor is covered by the entrypoint
+# (boot) and the watchdog (every 30s at runtime); this healthcheck stays a
+# liveness probe for nginx, which is what it is good at.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
     CMD curl -f -o /dev/null http://127.0.0.1:8080/assets/assets.json || exit 1
 

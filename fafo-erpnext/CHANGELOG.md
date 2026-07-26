@@ -2,15 +2,117 @@
 
 ## 15.1.2
 
-Boot-time self-healing for MariaDB grant host drift. No schema change, no
-data migration — this only repairs permissions. Existing sites pick the fix
-up on their next container restart.
+Self-healing for the two outages that hit a production Umbrel on 2026-07-26:
+MariaDB grant host drift (500 on every request) and a stale asset manifest
+(site renders as raw unstyled HTML). No schema change, no data migration.
+Existing sites pick both fixes up on their next container restart.
 
-### Fixed
+---
 
-- **Every request returned Internal Server Error 500 after a container
-  recreate.** Hit a production Umbrel on 2026-07-26, right after the v0.4.0
-  ERPNext MCP deploy. The Frappe log showed:
+### Fixed — asset manifest went stale after a container recreate
+
+The site loaded but rendered as raw HTML with no CSS. Every existing defense
+reported healthy throughout.
+
+**Mechanism.** Compiled bundles do not live in the sites volume. They live in
+the **image**, at `apps/<app>/<app>/public/dist/`, reached through per-app
+symlinks:
+
+```
+sites/assets/erpnext -> /home/frappe/frappe-bench/apps/erpnext/erpnext/public
+```
+
+Frappe v15 content-hashes every bundle filename
+(`erpnext.bundle.SLWNYXYQ.css`) and records the mapping in
+`sites/assets/assets.json` — which **does** live in the bind-mounted volume,
+and therefore survives a container recreate. So when the image is rebuilt,
+`bench build` emits new hashes into the new image's `dist/` dirs while the
+volume still holds the previous build's manifest. Every bundle URL in the
+served HTML then points at a hash that no longer exists:
+
+```
+/assets/erpnext/dist/css/erpnext.bundle.SLWNYXYQ.css -> 404
+```
+
+**Why nothing caught it.** The asset canary — in both the entrypoint and the
+watchdog — tested `assets.json` for presence and non-emptiness. A stale
+manifest is present and non-empty. The per-app directory check that would
+seem to help does not: `sites/assets/<app>` is a symlink into the image, so it
+resolves fine even when every hash behind it is wrong.
+
+**Two hypotheses investigated and ruled out**, both empirically:
+
+- *Dockerfile app-bake ordering.* Already correct — the last `bench get-app`
+  is at line 244, `bench build --production` at line 263, the snapshot copy at
+  line 267.
+- *Snapshot missing the new app's assets.* `agriculture`, `farm_i9`,
+  `farm_precision_ag`, and `erpnext_mcp` ship **no** `public/` or `www/`
+  directory. They have no frontend assets to build, so their absence from
+  `sites/assets/` is correct and permanent — a per-app presence check would
+  have been a false positive forever, and would still have missed this.
+
+### Added — asset floor check (defense layer 1, widened)
+
+New `build/asset_floor.py`, baked in as `/usr/local/bin/asset-floor` and
+shared by the entrypoint and the watchdog. The check is now **referential
+integrity, not presence**. A site passes when:
+
+1. `assets.json` exists, is non-empty, and parses (subsumes the old canary).
+2. Every `/assets/...` path it names resolves on disk — 46/46 on a healthy
+   boot. `assets-rtl.json` too, when present.
+3. Every app shipping `public/` or `www/` has its `sites/assets/` entry. Apps
+   with no frontend assets are skipped rather than flagged.
+
+Repair ladder, each step re-validated:
+
+1. **Restore from the `/var/lib/frappe-assets/` snapshot** — a two-second
+   `cp -a`. The snapshot came from the same image whose `dist/` dirs the
+   manifest must match, so it is by construction the right one. It is
+   validated *before* being trusted, so a broken snapshot can never overwrite
+   a working tree.
+2. **`bench build --production`** if the snapshot is missing or fails its own
+   check. Rate-limited (`ASSET_BUILD_MIN_INTERVAL`, default 3600s) so a
+   persistently broken tree cannot turn the 30s watchdog into a rebuild storm.
+   On success the snapshot is re-taken, keeping the fast path available for
+   the rest of the container's life.
+3. Give up loudly with copy-pasteable manual repair steps.
+
+The entrypoint runs it **twice** — before and after the app reconcile, since
+`bench install-app` runs migrations that can touch the asset tree, and the
+state that matters is the one supervisord is about to serve.
+
+### Changed — asset watchdog now shares that checker
+
+`asset_watchdog.sh` no longer implements its own canary test; it calls
+`asset-floor` every 30s. It passes `--clear-cache`, which the entrypoint does
+not need: Frappe caches the parsed manifest in Redis, so a mid-lifetime repair
+does not take effect until that is dropped — this is exactly why the manual
+fix needed `bench clear-cache` + `bench clear-website-cache`. At boot Redis
+has not started yet and runs with persistence disabled, so the cache is
+already empty. `--quiet-when-healthy` keeps the steady state silent.
+
+### Notes
+
+- `cp -a`, not `shutil.copytree` and not `cp -n`. `copytree(dirs_exist_ok=True,
+  symlinks=True)` raises `FileExistsError` on every per-app symlink that
+  already exists — measured: the restore aborted on all three and fell through
+  to a full rebuild, turning a two-second repair into a five-to-ten-minute one.
+  A no-clobber copy would leave the stale manifest in place and report success.
+- A non-zero exit from `bench build --production` is reported but **not**
+  treated as decisive. Observed in testing: it exited 1 on a translation
+  complaint while still emitting a complete, correct tree. The ladder believes
+  the post-build floor check instead.
+- `HEALTHCHECK` was deliberately **not** extended to the floor check. It would
+  report unhealthy for the entire 5-10 minutes a rebuild takes, and at
+  30s × 3 retries Umbrel would restart the container mid-build every time.
+
+---
+
+### Fixed — every request returned 500 after a container recreate
+
+- Hit the same production Umbrel on 2026-07-26, right after the v0.4.0
+  ERPNext MCP deploy, immediately before the asset outage above. The Frappe
+  log showed:
 
   ```
   pymysql.err.OperationalError: (1045, "Access denied for user

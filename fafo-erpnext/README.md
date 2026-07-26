@@ -85,7 +85,10 @@ Two things worth knowing:
 The entrypoint is idempotent and gated on
 `sites/.site-created`. On an existing install, an upgrade:
 
-- re-runs the asset canary / snapshot restore,
+- re-runs the asset floor check — validates that every entry in
+  `sites/assets/assets.json` still resolves on disk and restores from the
+  image snapshot if not (v15.1.2; this is what keeps a rebuilt image from
+  serving unstyled pages against a stale manifest),
 - reconciles every site's MariaDB user grant to `user@'%'` (v15.1.2 — this is
   what keeps a recreate from 500ing when Docker hands the container a new IP;
   it runs before the app reconcile below, which needs DB access to work),
@@ -117,6 +120,45 @@ docker exec -it -u frappe fafo-erpnext_server_1 bash
 Self-healing behaviour (asset canary, healthcheck, app reconcile, asset
 watchdog, DB grant reconcile) is documented in the header comment of
 [`build/entrypoint.sh`](build/entrypoint.sh).
+
+### The site loads but has no styling (raw HTML, no CSS)
+
+Cause: `sites/assets/assets.json` maps each bundle to a content-hashed
+filename, and it lives in the persisted volume — but the bundles themselves
+live in the image, at `apps/<app>/<app>/public/dist/`. A container recreate
+onto a rebuilt image changes every hash while the volume keeps the old
+manifest, so every CSS/JS URL 404s.
+
+**Since v15.1.2 this repairs itself** — at boot, and within 30 seconds at
+runtime via the watchdog. To check:
+
+```sh
+docker logs fafo-erpnext_server_1 | grep asset-floor
+```
+
+A healthy boot prints `floor OK — assets.json: 46/46 entries resolve`. To run
+the check on demand, or to see exactly what is dangling:
+
+```sh
+docker exec fafo-erpnext_server_1 \
+  /home/frappe/frappe-bench/env/bin/python /usr/local/bin/asset-floor --check-only
+```
+
+Drop `--check-only` to repair. If it reports it could not repair, it prints
+the manual steps; the short version is a snapshot copy plus a cache clear:
+
+```sh
+docker exec fafo-erpnext_server_1 \
+  cp -a /var/lib/frappe-assets/. /home/frappe/frappe-bench/sites/assets/
+docker exec fafo-erpnext_server_1 \
+  chown -R frappe:frappe /home/frappe/frappe-bench/sites/assets
+docker exec -u frappe fafo-erpnext_server_1 bash -c \
+  'cd /home/frappe/frappe-bench && bench --site frontend clear-cache \
+   && bench --site frontend clear-website-cache'
+```
+
+The cache clear is not optional: Frappe caches the parsed manifest in Redis,
+so restoring the files alone leaves the workers still emitting the old URLs.
 
 ### "Internal Server Error" on every page after an update
 
