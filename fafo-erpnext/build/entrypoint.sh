@@ -26,10 +26,21 @@
 #      reloads nginx. Closes the gap between "wipe" and "container
 #      reboot" — no unstyled page for more than ~30 seconds.
 #
-# Combined: any single cache clear, asset delete, or partial
-# migration recovers automatically on the next container restart with
-# zero manual intervention. Multiple simultaneous failures may still
-# require operator attention.
+#   5. DB grant self-heal (v15.1.2, this file + db_grant_selfheal.py,
+#      runs every boot). `bench new-site` pins the site's MariaDB user
+#      grant to the container's IP at creation time
+#      (`user@10.21.0.27`). Docker reassigns container IPs on recreate,
+#      after which every request 500s with
+#      `Access denied for user 'X'@'<new-ip>'`. This block reconciles
+#      each site's grant to the host-independent `user@'%'` using the
+#      root credentials compose already supplies, so the next IP
+#      change is a non-event. The incident that motivated it hit
+#      Tim's mom's Umbrel on 2026-07-26 after the v0.4.0 MCP deploy.
+#
+# Combined: any single cache clear, asset delete, partial migration,
+# or container-IP reassignment recovers automatically on the next
+# container restart with zero manual intervention. Multiple
+# simultaneous failures may still require operator attention.
 #
 # NOTE on the "clear-cache Redis safety net": intentionally omitted.
 # Redis isn't running when this entrypoint executes (supervisord
@@ -60,6 +71,13 @@
 #   9. Save the initial Administrator password to a 0600 file on the
 #      sites volume and print a credentials banner to stdout
 #      (v15.1.1 — see "First-boot credentials UX" below).
+#  10. Re-run the DB grant self-heal (v15.1.2) so the site bench just
+#      created gets its host-independent `user@'%'` grant immediately,
+#      rather than on the next boot.
+#
+# On EVERY boot (first or subsequent), before either path:
+#   - Asset canary restore (layer 1 above).
+#   - DB grant self-heal (layer 5 above).
 #
 # ── First-boot credentials UX (v15.1.1) ───────────────────────────
 # umbrelOS shows the app's password in its credentials modal, derived
@@ -100,6 +118,10 @@ DB_HOST="${DB_HOST:-fafo-erpnext_db_1}"
 DB_PORT="${DB_PORT:-3306}"
 DB_ROOT_PASS="${DB_ROOT_PASS:-changeme}"
 ADMIN_PASS="${ADMIN_PASS:-admin}"
+# Export the DB coordinates so the v15.1.2 grant self-heal helper (a
+# separate python process) sees the same values this script resolved,
+# including the defaults above when compose didn't set them.
+export DB_HOST DB_PORT DB_ROOT_PASS
 MARKER=/home/frappe/frappe-bench/sites/.site-created
 # Fallback copy of the initial Administrator password, written once at
 # first boot with mode 0600. Lives on the bind-mounted sites volume,
@@ -109,6 +131,34 @@ PASSWORD_FILE=/home/frappe/frappe-bench/sites/.admin-password-initial.txt
 # Public port the Umbrel app_proxy publishes (matches `port:` in
 # umbrel-app.yml). Display-only — used in the credentials banner.
 UMBREL_APP_PORT="${UMBREL_APP_PORT:-5300}"
+# Bench's virtualenv interpreter. Used for the DB grant self-heal below,
+# which needs pymysql — present in this venv (Frappe depends on it), NOT
+# in the system python3.
+BENCH_PY=/home/frappe/frappe-bench/env/bin/python
+
+# ── wait_for_mariadb [tries] ──────────────────────────────────────
+# Polls the DB port until it accepts TCP, then sleeps 3s so mysqld has
+# finished its own init and is actually answering auth (nc reports the
+# port open a beat before that). Returns 0 on success, 1 on timeout —
+# it never exits, so each caller decides whether a missing DB is fatal.
+# Callers: the v15.1.2 grant self-heal (non-fatal — a site that can't
+# be healed still boots) and first-boot site creation (fatal — there is
+# nothing to create the site in).
+wait_for_mariadb() {
+    local tries="${1:-60}"
+    local i
+    echo "[entrypoint] Waiting for MariaDB at $DB_HOST:$DB_PORT (up to $((tries * 2))s)..."
+    for i in $(seq 1 "$tries"); do
+        if nc -z "$DB_HOST" "$DB_PORT" 2>/dev/null; then
+            echo "[entrypoint] MariaDB reachable after ${i} tries."
+            sleep 3
+            return 0
+        fi
+        sleep 2
+    done
+    echo "[entrypoint] MariaDB unreachable after $((tries * 2))s."
+    return 1
+}
 
 # Fix volume ownership on EVERY boot. Umbrel creates
 # ${APP_DATA_DIR}/sites on the host as root:root, so the container's
@@ -163,6 +213,42 @@ if [ ! -f "$CANARY" ] || [ ! -s "$CANARY" ]; then
     fi
 else
     echo "[entrypoint] Asset canary present — no restore needed."
+fi
+
+# ── DB grant self-heal (v15.1.2) ──────────────────────────────────
+# Runs on EVERY boot, and deliberately BEFORE the marker fast-path
+# below — the drift this fixes only happens to sites that already
+# exist, so putting it on the first-boot path would never fire for the
+# case it was written for.
+#
+# `bench new-site` binds the site's MariaDB user to the container's
+# current IP (`user@10.21.0.27`). Docker hands out a different IP on
+# the next container recreate and Frappe's every query dies with
+# "Access denied for user 'X'@'<new-ip>'" — a 500 on every request,
+# with the correct password still sitting in site_config.json. Frappe
+# ships no bench command that repairs this, so we reconcile against
+# MariaDB directly: for each site, re-grant `user@'%'` (host-
+# independent) using the root credentials compose already provides.
+#
+# Fully idempotent: on a healthy site the statements are no-ops. The
+# helper prints a per-site before/after login probe so `docker logs`
+# shows whether anything was actually healed.
+#
+# NON-FATAL BY DESIGN. Every failure path — DB down, wrong root
+# password, malformed site_config.json — logs loudly and returns
+# non-zero, and we continue to supervisord anyway. A site with a bad
+# grant is still better than a container that will not start. The
+# helper's own retry loop handles a slow MariaDB, so the wait below
+# is short; `|| true` keeps `set -e` from turning either into a boot
+# failure.
+echo "[entrypoint] ── DB grant self-heal (v15.1.2) ──"
+if [ -x "$BENCH_PY" ]; then
+    wait_for_mariadb 15 || \
+        echo "[entrypoint] WARNING: MariaDB not reachable before grant self-heal — running it anyway (it retries internally)."
+    "$BENCH_PY" /usr/local/bin/db-grant-selfheal \
+        || echo "[entrypoint] WARNING: DB grant self-heal reported failures (see [db-selfheal] lines above). Continuing boot — the site may return 500s until repaired."
+else
+    echo "[entrypoint] WARNING: $BENCH_PY not found — skipping DB grant self-heal. If the site 500s with \"Access denied for user\", regrant manually (see fafo-erpnext/README.md)."
 fi
 
 # ── Fast path: existing site → idempotent app install, then run ───
@@ -220,23 +306,13 @@ fi
 echo "[entrypoint] First boot — creating site $SITE_NAME."
 
 # ── Wait for MariaDB ──────────────────────────────────────────────
-echo "[entrypoint] Waiting for MariaDB at $DB_HOST:$DB_PORT (up to 120s)..."
-for i in $(seq 1 60); do
-    if nc -z "$DB_HOST" "$DB_PORT" 2>/dev/null; then
-        echo "[entrypoint] MariaDB reachable after ${i} tries."
-        break
-    fi
-    if [ "$i" -eq 60 ]; then
-        echo "[entrypoint] MariaDB unreachable after 120s — aborting."
-        exit 1
-    fi
-    sleep 2
-done
-
-# Give MariaDB an extra beat for the mysqld to be actually accepting
-# auth (nc says the port's open but the server's own init might
-# still be in progress).
-sleep 3
+# Fatal here, unlike the self-heal's call above: there is no site yet
+# and nothing to create it in. wait_for_mariadb already includes the
+# post-connect settle sleep.
+wait_for_mariadb 60 || {
+    echo "[entrypoint] MariaDB unreachable — aborting first-boot site creation."
+    exit 1
+}
 
 # ── Prep bench state ──────────────────────────────────────────────
 cd /home/frappe/frappe-bench
@@ -415,6 +491,20 @@ sleep 1
 
 touch "$MARKER"
 chown frappe:frappe "$MARKER"
+
+# ── Pin the brand-new site's grant host-independent (v15.1.2) ─────
+# `bench new-site` just created this site's MariaDB user pinned to the
+# container's CURRENT IP. It works right now, and would break on the
+# first container recreate that lands on a different address. The
+# every-boot self-heal near the top of this script runs BEFORE the
+# site exists on a first boot, so it found nothing to do — run it once
+# more here to add the `user@'%'` grant while we still have the
+# operator's attention in the first-boot log. Same non-fatal contract.
+echo "[entrypoint] ── DB grant self-heal (post-new-site pass) ──"
+if [ -x "$BENCH_PY" ]; then
+    "$BENCH_PY" /usr/local/bin/db-grant-selfheal \
+        || echo "[entrypoint] WARNING: post-new-site grant self-heal reported failures (see [db-selfheal] lines above). Site is up; the grant will be retried on next boot."
+fi
 
 # ── Persist the initial Administrator password (v15.1.1) ──────────
 # Fallback channel (c) — see "First-boot credentials UX" at the top.

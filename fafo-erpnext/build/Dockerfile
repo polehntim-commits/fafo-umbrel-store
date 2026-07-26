@@ -49,6 +49,11 @@ FROM frappe/erpnext:v15.115.0
 # (`docker inspect`) that this image carries the runtime recovery
 # behavior: asset canary restore, healthcheck-driven restart, and
 # idempotent app reconcile. See entrypoint.sh for the full strategy.
+# NOTE: this pair is superseded by the LABEL near the COPY of
+# db-grant-selfheal at the bottom of this file (a later LABEL wins for the
+# same key). It is kept here, unchanged, purely so editing the self-heal
+# inventory does not invalidate the build cache for the ~6 GB of app clones
+# and `bench build` layers that follow.
 LABEL org.polehnfarm.self-heal="asset-canary,healthcheck,app-reconcile"
 LABEL org.polehnfarm.self-heal.version="1"
 
@@ -267,6 +272,22 @@ RUN if [ -d /home/frappe/frappe-bench/sites/assets ]; then \
 COPY supervisord.conf /etc/supervisor/conf.d/erpnext.conf
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
+# DB grant self-heal (v15.1.2). Reconciles each site's MariaDB user to a
+# host-independent `user@'%'` grant on every boot, so Docker reassigning
+# the container's IP stops producing "Access denied for user 'X'@'<ip>'"
+# on every request. Invoked by entrypoint.sh with the BENCH venv
+# interpreter — it needs pymysql, which lives in
+# /home/frappe/frappe-bench/env, not in the system python3. See the
+# module docstring for the full incident write-up.
+COPY db_grant_selfheal.py /usr/local/bin/db-grant-selfheal
+RUN chmod +x /usr/local/bin/db-grant-selfheal
+
+# Authoritative self-heal inventory (overrides the same keys set near the top
+# of this file). Placed down here so bumping it re-runs only the last few
+# cheap layers instead of the whole app-clone + bench-build chain.
+LABEL org.polehnfarm.self-heal="asset-canary,healthcheck,app-reconcile,db-grant"
+LABEL org.polehnfarm.self-heal.version="2"
 
 # Asset watchdog script (see supervisord.conf entry). Restores
 # sites/assets/ if runtime commands wipe it. See design notes in

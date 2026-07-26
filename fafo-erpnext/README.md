@@ -112,8 +112,57 @@ docker exec -it -u frappe fafo-erpnext_server_1 bash
 ```
 
 Self-healing behaviour (asset canary, healthcheck, app reconcile, asset
-watchdog) is documented in the header comment of
+watchdog, DB grant reconcile) is documented in the header comment of
 [`build/entrypoint.sh`](build/entrypoint.sh).
+
+### "Internal Server Error" on every page after an update
+
+Symptom: every request returns 500. The container log shows
+
+```
+pymysql.err.OperationalError: (1045, "Access denied for user
+'_5e5899d8398b5f7b'@'10.21.0.24' (using password: YES)")
+```
+
+Cause: `bench new-site` pinned the site's MariaDB user to the container's IP
+at creation time, and Docker gave the container a different IP when it was
+recreated. The password in `sites/frontend/site_config.json` is still correct —
+only the grant's *host* is wrong.
+
+**Since v15.1.2 this repairs itself on every boot.** Restart the app and check
+the log:
+
+```sh
+umbreld client apps.restart.mutate --appId fafo-erpnext
+docker logs fafo-erpnext_server_1 | grep db-selfheal
+```
+
+A healthy boot prints one `OK` or `HEALED` line per site. If it prints
+`ERROR`, the message says exactly what to fix — most often `DB_ROOT_PASS`
+(`${APP_SEED}`) not matching the MariaDB volume's root password, which means
+the db volume was initialized under a different seed and needs manual repair:
+
+```sh
+# Read the site's db_name and db_password, then regrant by hand.
+docker exec fafo-erpnext_server_1 cat \
+  /home/frappe/frappe-bench/sites/frontend/site_config.json
+docker exec -it fafo-erpnext_db_1 mysql -uroot -p
+#   CREATE USER IF NOT EXISTS `<db_name>`@'%' IDENTIFIED BY '<db_password>';
+#   ALTER  USER            `<db_name>`@'%' IDENTIFIED BY '<db_password>';
+#   GRANT ALL PRIVILEGES ON `<db_name>`.* TO `<db_name>`@'%';
+#   FLUSH PRIVILEGES;
+```
+
+The reconcile can also be run on demand without a restart:
+
+```sh
+docker exec fafo-erpnext_server_1 \
+  /home/frappe/frappe-bench/env/bin/python /usr/local/bin/db-grant-selfheal
+```
+
+Old IP-pinned grant rows are left in place (inert). Set
+`DB_GRANT_PRUNE_STALE=1` in the compose environment to have them dropped after
+a successful regrant.
 
 ---
 

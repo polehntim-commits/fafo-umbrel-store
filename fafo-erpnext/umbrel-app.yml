@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: fafo-erpnext
 category: business
 name: ERPNext + Agriculture + Farm HR + Precision Ag
-version: "15.1.1"
+version: "15.1.2"
 tagline: "Full-stack farm ERP: books, HR, precision ag, USDA pricing, and MCP for AI agents."
 icon: https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/fafo-erpnext/icon.png
 description: >-

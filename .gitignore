@@ -8,3 +8,7 @@ farm_i9/
 # to the container's sites/ volume, i.e. the Umbrel host, never here).
 # Belt-and-braces so a stray copy can't be committed by accident.
 .admin-password-initial.txt
+
+# Python bytecode from local syntax checks of the packaged helper scripts.
+__pycache__/
+*.pyc
