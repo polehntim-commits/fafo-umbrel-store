@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+#
 # ── Self-healing strategy ─────────────────────────────────────────
 # This container has four defense layers against runtime corruption:
 #
@@ -51,8 +53,34 @@
 #   5. Best-effort: fetch + install frappe/agriculture. Failure here
 #      doesn't fail the whole boot — the site is usable without it,
 #      and the user can install manually via the ERPNext UI later.
-#   6. Stop the inline redis so supervisord can manage it cleanly.
-#   7. Touch the marker file.
+#   6. Make sure the ERPNext Setup Wizard will run on first login
+#      (v15.1.1 — defensive, this is already the default).
+#   7. Stop the inline redis so supervisord can manage it cleanly.
+#   8. Touch the marker file.
+#   9. Save the initial Administrator password to a 0600 file on the
+#      sites volume and print a credentials banner to stdout
+#      (v15.1.1 — see "First-boot credentials UX" below).
+#
+# ── First-boot credentials UX (v15.1.1) ───────────────────────────
+# umbrelOS shows the app's password in its credentials modal, derived
+# from the Umbrel seed. That display broke on at least one Umbrel
+# build (it rendered the literal string `$APP_PASSWORD`), which left
+# the operator with no way to log in short of an SSH session. So the
+# password is now surfaced through three independent channels, any
+# one of which is sufficient:
+#
+#   a. Umbrel dashboard → app tile → "Show credentials"
+#      (fixed in v15.1.1 via `deterministicPassword: true`)
+#   b. `docker logs fafo-erpnext_server_1` — banner printed below,
+#      once, at the end of first boot. GROUND TRUTH: it echoes the
+#      exact ADMIN_PASS the site was created with.
+#   c. `~/umbrel/app-data/fafo-erpnext/sites/.admin-password-initial.txt`
+#      on the Umbrel host — owner-only (0600), survives container
+#      recreates because Umbrel bind-mounts sites/.
+#
+# All of (a)/(b)/(c) resolve to the same value. If they ever
+# disagree, (b) wins — it is emitted by the same shell invocation
+# that ran `bench new-site --admin-password`.
 #
 # On subsequent boots (marker exists):
 #   - Skip straight to `exec "$@"` which runs supervisord (via CMD).
@@ -73,6 +101,14 @@ DB_PORT="${DB_PORT:-3306}"
 DB_ROOT_PASS="${DB_ROOT_PASS:-changeme}"
 ADMIN_PASS="${ADMIN_PASS:-admin}"
 MARKER=/home/frappe/frappe-bench/sites/.site-created
+# Fallback copy of the initial Administrator password, written once at
+# first boot with mode 0600. Lives on the bind-mounted sites volume,
+# i.e. ~/umbrel/app-data/fafo-erpnext/sites/ on the Umbrel host. Never
+# committed to git — it is generated at runtime from ADMIN_PASS.
+PASSWORD_FILE=/home/frappe/frappe-bench/sites/.admin-password-initial.txt
+# Public port the Umbrel app_proxy publishes (matches `port:` in
+# umbrel-app.yml). Display-only — used in the credentials banner.
+UMBREL_APP_PORT="${UMBREL_APP_PORT:-5300}"
 
 # Fix volume ownership on EVERY boot. Umbrel creates
 # ${APP_DATA_DIR}/sites on the host as root:root, so the container's
@@ -330,6 +366,48 @@ fi
 # entrypoint (which re-runs on every boot). Saves 5-10 min of
 # Pi-side compilation on every fresh install.
 
+# ── Force the ERPNext Setup Wizard on first login (v15.1.1) ───────
+# Frappe v15 decides whether to show the Setup Wizard in
+# `frappe.is_setup_complete()`, which reads the `is_setup_complete`
+# column of the `Installed Application` child table for the `frappe`
+# and `erpnext` apps. It is NOT `System Settings.setup_complete`
+# (that field still exists, but v15 only writes it as a legacy mirror
+# from `disable_future_access()`), and it is NOT a `setup_complete`
+# key in site_config.json — no such key exists in v15.
+#
+# `bench new-site --install-app erpnext` already leaves both rows at
+# 0, so the wizard fires on first login by default. The writes below
+# are belt-and-braces against a future bench/app release changing
+# that default; on a normal boot they are no-ops. Both soft-fail — a
+# bench version that renames the column must not brick the boot.
+#
+# Runs while the inline redis is still up (bench needs it) and
+# strictly on the first-boot path, so an existing site is never
+# touched.
+#
+# What the wizard does NOT do: rewrite the Administrator account's
+# password. Its account slide CREATES a second User from the email +
+# password typed into it (frappe.desk.page.setup_wizard →
+# create_or_update_user); Administrator keeps ADMIN_PASS until
+# somebody changes it explicitly. That is why the README tells
+# operators to run `bench set-admin-password` once they are in.
+echo "[entrypoint] Ensuring the ERPNext Setup Wizard runs on first login..."
+SW_FRAPPE='{"dt": "Installed Application", "dn": {"app_name": "frappe"}, "field": "is_setup_complete", "val": 0}'
+SW_ERPNEXT='{"dt": "Installed Application", "dn": {"app_name": "erpnext"}, "field": "is_setup_complete", "val": 0}'
+SW_LEGACY='{"doctype": "System Settings", "fieldname": "setup_complete", "value": 0}'
+
+for SW_KWARGS in "$SW_FRAPPE" "$SW_ERPNEXT"; do
+    su frappe -s /bin/bash -c \
+        "cd /home/frappe/frappe-bench && bench --site $SITE_NAME execute frappe.db.set_value --kwargs '$SW_KWARGS'" \
+        >/dev/null 2>&1 \
+        || echo "[entrypoint] WARNING: could not clear is_setup_complete for $SW_KWARGS — leaving bench's default (normally 0, i.e. the wizard still shows)."
+done
+
+su frappe -s /bin/bash -c \
+    "cd /home/frappe/frappe-bench && bench --site $SITE_NAME execute frappe.db.set_single_value --kwargs '$SW_LEGACY'" \
+    >/dev/null 2>&1 \
+    || echo "[entrypoint] WARNING: could not clear System Settings.setup_complete — non-fatal, v15 reads Installed Application instead."
+
 # ── Cleanup: stop inline redis so supervisord starts clean ────────
 echo "[entrypoint] Stopping inline redis..."
 redis-cli shutdown nosave 2>/dev/null || true
@@ -337,6 +415,72 @@ sleep 1
 
 touch "$MARKER"
 chown frappe:frappe "$MARKER"
+
+# ── Persist the initial Administrator password (v15.1.1) ──────────
+# Fallback channel (c) — see "First-boot credentials UX" at the top.
+# Written only on this first-boot path, so an existing install
+# upgrading to v15.1.1 never gets the file and never sees the banner
+# below. The function body is a subshell so `umask 077` cannot leak
+# into the rest of the boot; the file is created 0600 from the outset
+# rather than chmod'ed after the fact, so the password is never
+# world-readable even momentarily.
+write_password_file() (
+    umask 077
+    cat > "$PASSWORD_FILE" <<PWFILE
+ERPNext + Agriculture + Farm HR + Precision Ag — initial credentials
+Written at first boot by fafo-erpnext entrypoint.sh (v15.1.1).
+
+  Username: Administrator
+  Password: $ADMIN_PASS
+
+This is the password the site was CREATED with. It stays valid for the
+Administrator account until you change it — the Setup Wizard's account
+step creates a separate named user and leaves Administrator alone.
+
+To change it:
+  docker exec -u frappe fafo-erpnext_server_1 \\
+    bench --site $SITE_NAME set-admin-password '<new-password>'
+
+Safe to delete this file once you have logged in and set your own
+password. The value is always recoverable with:
+  docker exec fafo-erpnext_server_1 printenv ADMIN_PASS
+PWFILE
+)
+
+if write_password_file; then
+    chmod 600 "$PASSWORD_FILE" 2>/dev/null || true
+    chown frappe:frappe "$PASSWORD_FILE" 2>/dev/null || true
+    echo "[entrypoint] Initial Administrator password saved to $PASSWORD_FILE (mode 0600)."
+else
+    echo "[entrypoint] WARNING: could not write $PASSWORD_FILE — recover the password with 'docker exec fafo-erpnext_server_1 printenv ADMIN_PASS'."
+fi
+
+# ── Credentials banner (v15.1.1) ──────────────────────────────────
+# Channel (b), and the authoritative one: this is the same shell that
+# just ran `bench new-site --admin-password "$ADMIN_PASS"`, so what it
+# prints is by construction the password the site actually has.
+# First-boot only — `docker logs fafo-erpnext_server_1` keeps it for
+# the life of the container, and `docker logs --since` still finds it
+# after later restarts.
+cat <<BANNER || true
+================================================================================
+ ERPNext + Agriculture + Farm HR + Precision Ag — FIRST-BOOT CREDENTIALS
+================================================================================
+  URL:       http://<your-umbrel-host>:$UMBREL_APP_PORT
+             (e.g. http://umbrel.local:$UMBREL_APP_PORT)
+  Username:  Administrator
+  Password:  $ADMIN_PASS
+
+  ERPNext's Setup Wizard runs on your first login. It walks you through
+  Company setup and creates your own named admin user. The Administrator
+  password above stays valid afterwards — change it when convenient.
+
+  To retrieve this password later:
+    docker exec fafo-erpnext_server_1 printenv ADMIN_PASS
+  Or, on the Umbrel host:
+    sudo cat ~/umbrel/app-data/fafo-erpnext/sites/.admin-password-initial.txt
+================================================================================
+BANNER
 
 echo "[entrypoint] First-boot setup complete. Starting supervisord."
 exec "$@"

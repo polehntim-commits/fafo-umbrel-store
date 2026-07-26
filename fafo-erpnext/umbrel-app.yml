@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: fafo-erpnext
 category: business
 name: ERPNext + Agriculture + Farm HR + Precision Ag
-version: "15.1.0"
+version: "15.1.1"
 tagline: "Full-stack farm ERP: books, HR, precision ag, USDA pricing, and MCP for AI agents."
 icon: https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/fafo-erpnext/icon.png
 description: >-
@@ -33,9 +33,14 @@ description: >-
   token, and ticks Enabled — install ships zero attack surface.
 
   First boot takes 5-10 minutes while the site is created and the
-  apps are installed. Default admin user is `Administrator`, password
-  is auto-generated as `APP_PASSWORD` (set by Umbrel, visible in the
-  app credentials screen).
+  apps are installed. The initial admin user is `Administrator` and
+  its password is derived from your Umbrel seed — tap "Show
+  credentials" on this app's tile to reveal it. The same password is
+  also printed to the container log at first boot
+  (`docker logs fafo-erpnext_server_1`) and saved on the host at
+  `~/umbrel/app-data/fafo-erpnext/sites/.admin-password-initial.txt`.
+  ERPNext's Setup Wizard runs on your first login and walks you
+  through creating your Company and your own named admin account.
 website: "https://frappe.io/erpnext"
 dependencies: []
 repo: >-
@@ -45,7 +50,20 @@ port: 5300
 gallery: []
 path: ""
 defaultUsername: "Administrator"
-defaultPassword: "$APP_PASSWORD"
+# v15.1.1: `defaultPassword: "$APP_PASSWORD"` was WRONG. umbreld does no
+# variable substitution inside umbrel-app.yml — that manifest field is a
+# literal string (schema: `defaultPassword: z.string().optional()`), so the
+# credentials modal rendered the text `$APP_PASSWORD` verbatim.
+# Substitution of `${APP_PASSWORD}` happens only in docker-compose.yml.
+#
+# The correct field is `deterministicPassword: true` — every official Umbrel
+# app that needs a login uses it (pi-hole, nextcloud, photoprism, code-server,
+# lndg, passky-server, …). It tells umbreld to derive and display
+#     HMAC-SHA256(<umbrel-seed>, "app-fafo-erpnext-seed-APP_PASSWORD")
+# which is byte-for-byte the value `${APP_PASSWORD}` resolves to in our
+# docker-compose.yml, i.e. exactly what lands in ADMIN_PASS. Supported since
+# umbrelOS 0.4.8, so it is safe across every Umbrel build in the field.
+deterministicPassword: true
 developer: Frappe Technologies (packaged by Tim Polehn)
 submitter: Tim Polehn
 submission: https://github.com/polehntim-commits/fafo-umbrel-store
