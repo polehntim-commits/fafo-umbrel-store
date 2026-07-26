@@ -88,6 +88,11 @@ services:
       PLAID_SECRET: ""
       PLAID_ENV: "sandbox"
       PLAID_REDIRECT_URI: "http://umbrel.local:5202/bankbridge/plaid/oauth_return"
+      # v0.7.0 — When Tailscale Funnel exposes this app publicly for Plaid OAuth,
+      # set this to the funnel hostname (e.g. `umbrel.tail1234.ts.net`) so the
+      # Plaid Settings UI can show the public URL. Leave empty until you run
+      # `sudo tailscale funnel 5202` on the host.
+      TAILSCALE_FUNNEL_HOSTNAME: ""
       ERPNEXT_URL: "http://umbrel.local:5300"
       ERPNEXT_API_KEY: ""
       ERPNEXT_API_SECRET: ""
