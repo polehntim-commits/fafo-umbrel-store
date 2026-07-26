@@ -86,6 +86,9 @@ The entrypoint is idempotent and gated on
 `sites/.site-created`. On an existing install, an upgrade:
 
 - re-runs the asset canary / snapshot restore,
+- reconciles every site's MariaDB user grant to `user@'%'` (v15.1.2 — this is
+  what keeps a recreate from 500ing when Docker hands the container a new IP;
+  it runs before the app reconcile below, which needs DB access to work),
 - reconciles baked-in Frappe apps that aren't installed on the site yet,
 - and starts supervisord.
 
