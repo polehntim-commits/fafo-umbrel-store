@@ -50,13 +50,17 @@ services:
       retries: 20
 
   server:
-    # Pinned tag — bump on release, don't use floating `:latest` so Umbrel
-    # deploys are reproducible and easy to roll back.
+    # v0.7.1 — FLOATING within the 0.7 series, deliberately. Patch releases in
+    # 0.7.x now auto-deploy on `docker pull` + app restart with no compose edit;
+    # only a major/minor jump (0.8, 1.0) changes this line. Still not `:latest`,
+    # so an upgrade can never cross a version that changes the compose contract.
     #   0.1.0  first cut
     #   0.4.x  Plaid statements + Postgres rescue + reconciliation ledger
     #   0.5.x  investment JE posting + advisory + opening-balance backdating
     #   0.6.0  MCP server (14 tools, per-tool kill switches, audit log)
-    image: polehntim/bank-bridge:0.7.0
+    #   0.7.0  guided Tailscale Funnel setup for the Plaid OAuth redirect URI
+    #   0.7.1  Tailscale sidecar — one-click public URL, 4 new MCP tools
+    image: polehntim/bank-bridge:0.7
     restart: on-failure
     stop_grace_period: 1m
     depends_on:
@@ -93,6 +97,13 @@ services:
       # Plaid Settings UI can show the public URL. Leave empty until you run
       # `sudo tailscale funnel 5202` on the host.
       TAILSCALE_FUNNEL_HOSTNAME: ""
+      # v0.7.1 — how the server talks to the tailscale sidecar below. Keep these
+      # three in sync with that service's TS_LOCAL_ADDR_PORT / TS_SOCKET /
+      # TS_SERVE_CONFIG; they are the same three values seen from the other side.
+      TAILSCALE_SIDECAR_ENABLED: "true"
+      TAILSCALE_LOCAL_ADDR_PORT: "127.0.0.1:41414"
+      TAILSCALE_SOCKET: /var/run/tailscale/tailscaled.sock
+      TAILSCALE_SERVE_CONFIG: /config/serve.json
       ERPNEXT_URL: "http://umbrel.local:5300"
       ERPNEXT_API_KEY: ""
       ERPNEXT_API_SECRET: ""
@@ -107,3 +118,88 @@ services:
       DB_RESCUE_SALT: bankbridge-rescue-v1
     volumes:
       - ${APP_DATA_DIR}/data/fafo-bank-bridge:/data
+      # v0.7.1 — shared with the tailscale sidecar below.
+      #   * the serve config the sidecar WATCHES. Bank Bridge writes this file to
+      #     turn Funnel on and off; containerboot re-applies it on change. This
+      #     is the write channel, and it is declarative, so it survives a sidecar
+      #     restart (a LocalAPI POST would not).
+      - ${APP_DATA_DIR}/tailscale/config:/config
+      #   * the sidecar's LocalAPI socket, read-only here. Used ONLY to learn the
+      #     tailnet FQDN — nothing else can tell us, because ${TS_CERT_DOMAIN} is
+      #     substituted inside tailscaled. Best-effort: if this mount is missing
+      #     the wizard falls back to TAILSCALE_FUNNEL_HOSTNAME or a pasted value.
+      - ${APP_DATA_DIR}/tailscale/run:/var/run/tailscale:ro
+
+  # ── v0.7.1 · Tailscale sidecar ───────────────────────────────────────────
+  # WHY THIS EXISTS. Plaid OAuth needs a public HTTPS callback. Umbrel's
+  # Tailscale community app cannot provide one for a sibling container:
+  #
+  #     error: failed apply web serve: only localhost or 127.0.0.1 proxies
+  #     are currently supported
+  #
+  # Funnel proxies to its OWN localhost, and that app's localhost is not Bank
+  # Bridge. `network_mode: "service:server"` below fixes it at the root — this
+  # container shares the server's network namespace, so its 127.0.0.1:5202 IS
+  # our gunicorn and Funnel will happily proxy to it.
+  #
+  # UNAUTHENTICATED IS A VALID STATE. With TS_AUTHKEY empty this container comes
+  # up, fails to log in, and idles. Nothing else breaks: /healthz answers 503,
+  # the wizard renders "sidecar needs authentication" and tells the operator
+  # where to get a key. That is what makes 0.7.0 → 0.7.1 a safe upgrade for an
+  # install whose operator has not supplied a key yet.
+  tailscale:
+    # Pinned to match the version Umbrel's own Tailscale app ships, so an
+    # operator running both does not have two client versions on one tailnet.
+    image: tailscale/tailscale:v1.90.8
+    restart: on-failure
+    stop_grace_period: 30s
+    # Share the server's network namespace. NOTE: `hostname:` is deliberately
+    # ABSENT — Docker rejects the combination outright ("conflicting options:
+    # hostname and the network mode"), and it would be redundant anyway: the
+    # tailnet node name comes from TS_HOSTNAME below, not the container hostname.
+    # Consequence to know: recreating `server` destroys this namespace, so this
+    # container must be recreated too. `restart: on-failure` covers it.
+    network_mode: "service:server"
+    depends_on:
+      - server
+    environment:
+      # The ONLY value an operator has to supply. Generate a REUSABLE auth key at
+      # https://login.tailscale.com/admin/settings/keys — reusable because this
+      # container re-authenticates whenever it restarts. Empty = idle, see above.
+      TS_AUTHKEY: "${TS_AUTHKEY:-}"
+      TS_HOSTNAME: fafo-bank-bridge
+      TS_STATE_DIR: /var/lib/tailscale
+      # Userspace networking: no /dev/net/tun, no NET_ADMIN capability. Serve and
+      # Funnel both work in this mode, and it keeps the container unprivileged.
+      TS_USERSPACE: "true"
+      # Only log in when not already logged in, so a restart with a since-revoked
+      # key doesn't wipe working state.
+      TS_AUTH_ONCE: "true"
+      # The serve config Bank Bridge writes. Watched for changes and re-applied.
+      TS_SERVE_CONFIG: /config/serve.json
+      TS_SOCKET: /var/run/tailscale/tailscaled.sock
+      # /healthz is how the server tells "no sidecar" (connection refused) from
+      # "sidecar with no authkey" (503) from "ready" (200). Bound to LOOPBACK on
+      # purpose: the default is [::]:9002 on ALL interfaces, and because this
+      # container shares the server's namespace that default would expose
+      # /healthz to the LAN. 41414 avoids Bank Bridge's own 5202.
+      TS_ENABLE_HEALTH_CHECK: "true"
+      TS_LOCAL_ADDR_PORT: "127.0.0.1:41414"
+    volumes:
+      # Node identity + keys. MUST persist, or the node re-registers as a new
+      # machine on every restart and the tailnet fills with dead duplicates.
+      - ${APP_DATA_DIR}/tailscale/state:/var/lib/tailscale
+      # Written by the server (read here). A directory mount, not a file mount:
+      # containerboot detects updates by watching the directory, and a bind-
+      # mounted single file would not show a replaced inode.
+      - ${APP_DATA_DIR}/tailscale/config:/config
+      # The LocalAPI socket, published for the server to read.
+      - ${APP_DATA_DIR}/tailscale/run:/var/run/tailscale
+    healthcheck:
+      test: ["CMD", "tailscale", "status", "--json"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Generous: a first login has to reach the control plane and provision a
+      # TLS certificate before `status` is meaningful.
+      start_period: 60s
