@@ -93,6 +93,10 @@ The entrypoint is idempotent and gated on
   what keeps a recreate from 500ing when Docker hands the container a new IP;
   it runs before the app reconcile below, which needs DB access to work),
 - reconciles baked-in Frappe apps that aren't installed on the site yet,
+- asserts `default_site` in `common_site_config.json` (v15.1.2 — a no-op on a
+  healthy install, since `bench new-site --set-default` already sets it; it
+  covers a config restored from backup or hand-edited without the key, which
+  would break `bench` invoked without `--site`),
 - and starts supervisord.
 
 It does **not** re-create the site, reset any password, write
@@ -120,6 +124,31 @@ docker exec -it -u frappe fafo-erpnext_server_1 bash
 Self-healing behaviour (asset canary, healthcheck, app reconcile, asset
 watchdog, DB grant reconcile) is documented in the header comment of
 [`build/entrypoint.sh`](build/entrypoint.sh).
+
+### The MCP endpoint returns `{"code": -32600, "message": "not found"}`
+
+This is not a bug and not a routing problem — it is the endpoint telling you it
+is still inert. `erpnext_mcp` returns exactly this, with HTTP 404, when the
+master switch is off or no auth token is set, deliberately opaque so a prober
+cannot distinguish "disabled" from "does not exist". Open
+`/app/erpnext-mcp-settings`, generate a token, tick **Enabled**.
+
+It is unrelated to the Host header: the same response comes back whether you
+connect by hostname or bare IP. Accessing this app by IP works out of the box —
+nginx pins the site name, so `Host: <anything>` routes to the `frontend` site.
+
+When you connect a client, present the token as **`X-MCP-Token`**, not
+`Authorization: Bearer`. Frappe's auth layer inspects `Authorization` before any
+whitelisted method runs and feeds a `Bearer` value into its OAuth2 validator, so
+a perfectly good token can reach the MCP handler as nothing and you get a 401
+from Frappe rather than an answer from the MCP:
+
+```sh
+curl -s http://<host>:5300/api/method/erpnext_mcp.mcp.handle \
+  -H 'Content-Type: application/json' \
+  -H 'X-MCP-Token: <your token>' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}'
+```
 
 ### The site loads but has no styling (raw HTML, no CSS)
 

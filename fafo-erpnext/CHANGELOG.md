@@ -108,6 +108,60 @@ already empty. `--quiet-when-healthy` keeps the steady state silent.
 
 ---
 
+### Added — `default_site` floor
+
+The entrypoint now asserts `default_site` in `common_site_config.json` on every
+boot, late on both boot paths (after the site is known to exist, so it can
+never name a site `bench new-site` failed to create). The write is atomic —
+temp file in the same directory, then `os.replace` — because a partial write to
+`common_site_config.json` takes down the whole bench, not just this key.
+
+**This is insurance, not a fix for anything currently broken**, and it is worth
+being precise about what it does:
+
+- It is **not** what serves HTTP. `supervisord.conf` already pins
+  `FRAPPE_SITE_NAME_HEADER="frontend"`, so nginx sends
+  `X-Frappe-Site-Name: frontend` on every proxied request and Frappe never
+  consults the Host header or `default_site` for web traffic. Verified: with
+  `Host: 100.69.162.122`, `Host: umbrel.local:5300`, `Host: frontend` and
+  `Host: totally-bogus.example`, `/api/method/ping` returns HTTP 200 in all
+  four cases.
+- `bench new-site --set-default` already writes it on first boot, so on a
+  healthy install this block logs `default_site already 'frontend' — no change`
+  and does nothing.
+- What it protects is everything that does **not** go through nginx — `bench`
+  invoked without `--site`, and tooling that resolves the site from the bench
+  config — in the case where `common_site_config.json` is restored from a
+  backup, hand-edited, or regenerated without the key.
+
+A corrupt or unparseable `common_site_config.json` is reported and left
+untouched rather than rewritten.
+
+### Not a bug — `{"code": -32600, "message": "not found"}` from the MCP endpoint
+
+Reported alongside the two outages above and investigated as a third. It is
+neither a bug nor related to Host-header routing: it is `erpnext_mcp`'s
+documented **ships-inert** behavior. `authorize()` raises
+`AuthError("not found", http_status=404)` when the master switch is off or no
+`auth_token` is configured, deliberately opaque so an unauthenticated prober
+cannot tell "disabled" from "does not exist".
+
+Reproduced exactly, and confirmed independent of the Host header — the same
+`-32600 not found` comes back for `Host: 100.69.162.122`, `Host: frontend` and
+`Host: umbrel.local:5300` alike. After enabling the endpoint and generating a
+token at `/app/erpnext-mcp-settings`, a full `initialize` handshake succeeds
+over a bare-IP Host.
+
+One gotcha worth knowing when connecting a client: present the token as
+**`X-MCP-Token`**, not `Authorization: Bearer`. Frappe's own auth layer
+inspects `Authorization` before any whitelisted method runs and routes a
+`Bearer` value into its OAuth2 validator, so a correct token can arrive at the
+MCP handler as nothing at all — observed here as a 401 from
+`frappe.auth.validate_auth`, before `erpnext_mcp` ever sees the request.
+`X-MCP-Token` is a header Frappe has no opinion about.
+
+---
+
 ### Fixed — every request returned 500 after a container recreate
 
 - Hit the same production Umbrel on 2026-07-26, right after the v0.4.0

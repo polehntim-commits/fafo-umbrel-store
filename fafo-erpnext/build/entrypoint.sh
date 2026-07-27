@@ -242,6 +242,91 @@ asset_floor_check() {
 
 asset_floor_check "pre-app-reconcile"
 
+# ── default_site floor (v15.1.2) ──────────────────────────────────
+# Frappe is multi-tenant and picks the site per request. This container
+# is single-tenant, and pins that choice in TWO independent places:
+#
+#   1. `FRAPPE_SITE_NAME_HEADER="frontend"` in supervisord.conf, which
+#      makes nginx send `X-Frappe-Site-Name: frontend` on every proxied
+#      request regardless of the Host header. This is what already makes
+#      bare-IP access work — verified: `Host: 100.69.162.122`,
+#      `Host: umbrel.local:5300` and `Host: totally-bogus.example` all
+#      return HTTP 200 from /api/method/ping.
+#   2. `default_site` in common_site_config.json — this block.
+#
+# (2) is NOT what serves HTTP; nginx's header wins and is consulted
+# first. It is the fallback for everything that does NOT go through
+# nginx: `bench` invoked without `--site`, and any tooling that resolves
+# the site from the bench config. `bench new-site --set-default` already
+# writes it on first boot, so on a healthy install this is a no-op — it
+# exists for the case where common_site_config.json is restored from a
+# backup, hand-edited, or regenerated without it, which would otherwise
+# leave those paths with no site to resolve.
+#
+# Runs late (after the site exists) on both boot paths, so it can never
+# point default_site at a site `bench new-site` failed to create.
+#
+# The write is atomic — temp file in the same dir, then rename. A partial
+# write to common_site_config.json would take down the entire bench, not
+# just this setting, so truncate-then-write (`json.dump(d, open(p,'w'))`)
+# is not safe enough for this particular file.
+ensure_default_site() {
+    local csc=/home/frappe/frappe-bench/sites/common_site_config.json
+    local py="$BENCH_PY"
+    [ -x "$py" ] || py=$(command -v python3)
+    if [ -z "$py" ] || [ ! -f "$csc" ]; then
+        echo "[entrypoint] Skipping default_site check (no python3 or no $csc)."
+        return 0
+    fi
+    "$py" - "$csc" "$SITE_NAME" <<'PYEOF' \
+        || echo "[entrypoint] WARNING: could not set default_site — non-fatal. HTTP still routes via nginx's X-Frappe-Site-Name; only bench-without---site is affected."
+import json, os, sys, tempfile
+
+path, site = sys.argv[1], sys.argv[2]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        cfg = json.load(fh)
+except (OSError, json.JSONDecodeError) as exc:
+    print(f"[entrypoint] WARNING: cannot read {path} ({exc}) — leaving default_site alone.", flush=True)
+    raise SystemExit(1)
+
+if not isinstance(cfg, dict):
+    print(f"[entrypoint] WARNING: {path} is not a JSON object — leaving default_site alone.", flush=True)
+    raise SystemExit(1)
+
+current = cfg.get("default_site")
+if current == site:
+    print(f"[entrypoint] default_site already '{site}' — no change.", flush=True)
+    raise SystemExit(0)
+
+print(f"[entrypoint] Setting default_site to '{site}' (was: {current!r}).", flush=True)
+cfg["default_site"] = site
+
+# Write to a temp file in the SAME directory (so rename is atomic on the
+# same filesystem), fsync, then rename over the original. Preserve the
+# existing mode rather than inheriting mkstemp's 0600.
+d = os.path.dirname(path)
+mode = os.stat(path).st_mode & 0o777
+fd, tmp = tempfile.mkstemp(dir=d, prefix=".common_site_config.", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=1, sort_keys=True)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+print(f"[entrypoint] default_site set to '{site}'.", flush=True)
+PYEOF
+    chown frappe:frappe "$csc" 2>/dev/null || true
+}
+
 # ── DB grant self-heal (v15.1.2) ──────────────────────────────────
 # Runs on EVERY boot, and deliberately BEFORE the marker fast-path
 # below — the drift this fixes only happens to sites that already
@@ -331,6 +416,7 @@ if [ -f "$MARKER" ]; then
     # matters is the one supervisord is about to serve — not the one we saw
     # before the installs ran. Cheap when healthy (a few dozen stat calls).
     asset_floor_check "post-app-reconcile"
+    ensure_default_site
 
     echo "[entrypoint] App check complete, starting supervisord."
     exec "$@"
@@ -609,6 +695,7 @@ BANNER
 # touch the asset tree. Same rationale as the fast path's post-reconcile
 # check: validate what supervisord is about to serve.
 asset_floor_check "post-first-boot-installs"
+ensure_default_site
 
 echo "[entrypoint] First-boot setup complete. Starting supervisord."
 exec "$@"
