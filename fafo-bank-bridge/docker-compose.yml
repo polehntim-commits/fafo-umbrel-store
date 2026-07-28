@@ -50,9 +50,9 @@ services:
       retries: 20
 
   server:
-    # v0.7.1 — FLOATING within the 0.7 series, deliberately. Patch releases in
-    # 0.7.x now auto-deploy on `docker pull` + app restart with no compose edit;
-    # only a major/minor jump (0.8, 1.0) changes this line. Still not `:latest`,
+    # v0.8.1 — FLOATING within the 0.8 series, deliberately. Patch releases in
+    # 0.8.x now auto-deploy on `docker pull` + app restart with no compose edit;
+    # only a major/minor jump (0.9, 1.0) changes this line. Still not `:latest`,
     # so an upgrade can never cross a version that changes the compose contract.
     #   0.1.0  first cut
     #   0.4.x  Plaid statements + Postgres rescue + reconciliation ledger
@@ -60,7 +60,12 @@ services:
     #   0.6.0  MCP server (14 tools, per-tool kill switches, audit log)
     #   0.7.0  guided Tailscale Funnel setup for the Plaid OAuth redirect URI
     #   0.7.1  Tailscale sidecar — one-click public URL, 4 new MCP tools
-    image: polehntim/bank-bridge:0.7
+    #   0.7.5  AUM double-count hotfix (holdings + cash summed twice)
+    #   0.8.0  Sprint 3C — investment reconciliation toolkit, 7 new MCP tools,
+    #          portfolio identity + mark-to-market bucket + trade-leg pairing
+    #   0.8.1  Sprint 3D — trade-leg pairing handles WF same-account pattern
+    #          (previously left ~1,200 legs unpaired on OML)
+    image: polehntim/bank-bridge:0.8
     restart: on-failure
     stop_grace_period: 1m
     depends_on:
