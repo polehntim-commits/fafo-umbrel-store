@@ -220,7 +220,16 @@ USER root
 
 # ── Cache-bust when polehntim/erpnext_mcp main branch advances ────
 # Same pattern as farm_i9, hrms, farm_precision_ag above.
+#
+# TWO busters, because the ADD alone is not enough. The ADD keys on
+# the GitHub API response, so it only sees a commit that has been
+# PUSHED — a local-only commit on erpnext_mcp main leaves this layer
+# cached and the image ships the old app. ERPNEXT_MCP_VERSION below
+# is the manual one: it is expanded into the RUN command, so
+# changing it changes the layer key. Comments do NOT work for this;
+# Docker strips them before hashing the instruction.
 ADD https://api.github.com/repos/polehntim-commits/erpnext_mcp/commits/main /tmp/.erpnext_mcp_head.json
+ARG ERPNEXT_MCP_VERSION=0.10.0
 
 # ── Bake polehntim/erpnext_mcp into the image ─────────────────────
 # MCP (Model Context Protocol) server exposed as a Frappe custom
@@ -241,6 +250,7 @@ ADD https://api.github.com/repos/polehntim-commits/erpnext_mcp/commits/main /tmp
 # install -e) as sibling apps to guarantee importable at runtime.
 USER frappe
 RUN cd /home/frappe/frappe-bench && \
+    echo "[dockerfile] baking erpnext_mcp target ${ERPNEXT_MCP_VERSION}" && \
     (bench get-app --branch main erpnext_mcp https://github.com/polehntim-commits/erpnext_mcp.git \
      || echo "[dockerfile] erpnext_mcp get-app failed at build — will attempt pip install anyway") && \
     (if [ -d apps/erpnext_mcp ]; then \
