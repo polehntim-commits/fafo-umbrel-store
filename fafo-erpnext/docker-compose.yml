@@ -80,5 +80,33 @@ services:
       DB_PORT: "3306"
       DB_ROOT_PASS: "${APP_SEED}"
       ADMIN_PASS: "${APP_PASSWORD}"
+    # ── farmops-api (erpnext_mcp v0.18.0) ──────────────────────────
+    # THE BIND ADDRESS IS THE WHOLE POINT OF THIS LINE.
+    #
+    # Umbrel's Tailscale app proxies Funnel traffic to ITS OWN
+    # localhost — that is not a preference, it is what tailscaled
+    # enforces ("only localhost or 127.0.0.1 proxies are currently
+    # supported"; see the long note in fafo-bank-bridge's compose,
+    # which hit the same wall and solved it with a shared network
+    # namespace). That container shares the HOST network namespace,
+    # which is why the existing funnel entry can say
+    # `http://127.0.0.1:5300` and reach this app at all: 5300 is the
+    # port Umbrel publishes for fafo-erpnext ON THE HOST.
+    #
+    # So a service listening on 127.0.0.1:5250 *inside this container*
+    # is invisible to Funnel — a container's loopback is its own. The
+    # port has to exist on the host's loopback, and that is what this
+    # publishes.
+    #
+    # `127.0.0.1:` IS NOT OPTIONAL. Plain `5250:5250` would bind
+    # 0.0.0.0 and put the mobile API on the farm LAN, reachable by
+    # anything on the network. Pinning the host side to loopback means
+    # exactly two things can reach it: processes on the Umbrel itself,
+    # and the Tailscale container that shares its namespace. The
+    # credential gate, the role gate, the Mobile Access Grant, entity
+    # scoping and the rate limit all still run on every call — this is
+    # the layer BEFORE any of that, and it costs one prefix.
+    ports:
+      - "127.0.0.1:5250:5250"
     volumes:
       - ${APP_DATA_DIR}/sites:/home/frappe/frappe-bench/sites

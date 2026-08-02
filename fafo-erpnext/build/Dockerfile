@@ -13,6 +13,18 @@
 #                   the image snapshot if a runtime command wipes it
 #   * redis      — local, 3 logical DBs (0=cache, 1=queue, 2=socketio)
 #   * backend    — Frappe Python via gunicorn on 127.0.0.1:8000
+#   * farmops-api — erpnext_mcp v0.18.0's mobile API via gunicorn on
+#                   0.0.0.0:5250 in-container, published to the host
+#                   as 127.0.0.1:5250 by the compose. It serves the
+#                   eleven methods the Farm Ops iOS app calls, OFF
+#                   Frappe's /api/method handler — through the
+#                   Tailscale funnel that handler answered every
+#                   credential carrier with the Desk's HTML login
+#                   page. It still imports Frappe and calls the same
+#                   guarded functions; Frappe is just no longer the
+#                   thing that reads the request. NO NEW PACKAGES:
+#                   gunicorn is already in the bench venv and
+#                   Werkzeug ships with Frappe. See supervisord.conf.
 #   * frontend   — nginx on 0.0.0.0:8080 (Umbrel app_proxy target)
 #   * websocket  — Node socket.io on 127.0.0.1:9000
 #   * queue-short — background worker for short + default queues
@@ -67,6 +79,7 @@ RUN apt-get update && \
         supervisor \
         redis-server \
         netcat-openbsd \
+        libreoffice-writer \
     && rm -rf /var/lib/apt/lists/*
 
 # Redis tuning: bind localhost only (no external access), cap memory
@@ -229,7 +242,7 @@ USER root
 # changing it changes the layer key. Comments do NOT work for this;
 # Docker strips them before hashing the instruction.
 ADD https://api.github.com/repos/polehntim-commits/erpnext_mcp/commits/main /tmp/.erpnext_mcp_head.json
-ARG ERPNEXT_MCP_VERSION=0.10.0
+ARG ERPNEXT_MCP_VERSION=0.18.0
 
 # ── Bake polehntim/erpnext_mcp into the image ─────────────────────
 # MCP (Model Context Protocol) server exposed as a Frappe custom
@@ -277,6 +290,24 @@ RUN if [ -d /home/frappe/frappe-bench/sites/assets ]; then \
         cp -r /home/frappe/frappe-bench/sites/assets/. /var/lib/frappe-assets/ && \
         chown -R frappe:frappe /var/lib/frappe-assets; \
     fi
+
+# ── farmops-api's log directory (erpnext_mcp v0.18.0) ─────────────
+# supervisord writes /home/frappe/frappe-bench/logs/farmops-api.log,
+# and supervisord does NOT create a missing parent — it fails the
+# program at startup instead, which on a fresh container looks like
+# "the mobile API is down" with nothing in `docker logs` to say why.
+# The bench normally has this dir, but `sites/` is the only path the
+# Umbrel compose bind-mounts, so `logs/` is whatever the image says
+# it is. Cheap insurance, one layer, no cache impact on anything above.
+RUN mkdir -p /home/frappe/frappe-bench/logs && \
+    chown -R frappe:frappe /home/frappe/frappe-bench/logs
+
+# NOTE ON DEPENDENCIES: farmops-api deliberately adds NONE. It runs on
+# the bench venv's own gunicorn (the same binary the `backend` program
+# uses) and on Werkzeug, which Frappe already depends on. `pip install
+# flask` here would resolve against Frappe's pinned Werkzeug inside the
+# venv that runs a production ledger; the failure mode of getting that
+# wrong is the whole site, not one endpoint.
 
 # Supervisord process definitions + our first-boot entrypoint.
 COPY supervisord.conf /etc/supervisor/conf.d/erpnext.conf
