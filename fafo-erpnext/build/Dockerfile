@@ -273,9 +273,14 @@ RUN cd /home/frappe/frappe-bench && \
         echo "[dockerfile] apps/erpnext_mcp dir missing — nothing to pip install"; \
      fi)
 USER frappe
+# erpnext_mcp declares these and imports every one of them defensively: without
+# shapely and h3 the six boundary tools go unavailable, without reportlab the two
+# tax-form PDF tools do (v0.36.0), and in both cases they say so by name rather
+# than taking the rest of the app down with them. Baked in so the image never
+# ships in that degraded state.
 RUN cd /home/frappe/frappe-bench && \
-    echo "[dockerfile] installing geo dependencies (shapely, h3)" && \
-    env/bin/pip install shapely h3
+    echo "[dockerfile] installing erpnext_mcp dependencies (shapely, h3, reportlab)" && \
+    env/bin/pip install shapely h3 reportlab
 
 USER root
 
