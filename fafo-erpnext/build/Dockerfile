@@ -272,6 +272,11 @@ RUN cd /home/frappe/frappe-bench && \
      else \
         echo "[dockerfile] apps/erpnext_mcp dir missing — nothing to pip install"; \
      fi)
+USER frappe
+RUN cd /home/frappe/frappe-bench && \
+    echo "[dockerfile] installing geo dependencies (shapely, h3)" && \
+    env/bin/pip install shapely h3
+
 USER root
 
 # ── Pre-build all app assets AND cache them for restore ───────────
