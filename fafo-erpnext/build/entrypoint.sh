@@ -152,6 +152,21 @@ UMBREL_APP_PORT="${UMBREL_APP_PORT:-5300}"
 # in the system python3.
 BENCH_PY=/home/frappe/frappe-bench/env/bin/python
 
+# ── wkhtmltopdf's fontconfig cache (2026-08-07) ───────────────────
+# The Dockerfile creates /var/cache/fontconfig 0777 at build time and
+# that is where the fix belongs. This repeats it at every boot for the
+# one case a build-time layer cannot cover: a running container whose
+# /var/cache was cleared, or a host that has bind-mounted over it. It
+# costs one mkdir on a path that almost always already exists.
+#
+# Without a writable cache directory fontconfig aborts before laying
+# out a glyph, wkhtmltopdf exits non-zero, and every Print → PDF in the
+# Desk fails with "No writable cache directories" — which reads as a
+# broken print format and is not one. `|| true` because a container
+# that somehow cannot create it should still boot and serve the site:
+# PDF export is one feature, not the app.
+mkdir -p /var/cache/fontconfig 2>/dev/null && chmod 777 /var/cache/fontconfig 2>/dev/null || true
+
 # ── wait_for_mariadb [tries] ──────────────────────────────────────
 # Polls the DB port until it accepts TCP, then sleeps 3s so mysqld has
 # finished its own init and is actually answering auth (nc reports the

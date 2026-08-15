@@ -343,6 +343,32 @@ RUN chmod +x /usr/local/bin/db-grant-selfheal
 COPY asset_floor.py /usr/local/bin/asset-floor
 RUN chmod +x /usr/local/bin/asset-floor
 
+# ── wkhtmltopdf's fontconfig cache (2026-08-07) ───────────────────
+# Every Print → PDF in the Desk goes through wkhtmltopdf, which starts
+# by asking fontconfig to build its font cache. fontconfig wants
+# /var/cache/fontconfig to be writable; in this image it either does
+# not exist or is root-owned, and the Frappe processes run as the
+# `frappe` user. fontconfig then dies before a single glyph is laid
+# out, and Frappe surfaces it as
+#
+#     Fontconfig error: No writable cache directories
+#
+# with an empty or failed PDF. The symptom looks like a broken print
+# format — it is not; no template can work around a renderer that
+# cannot start, which is why the fix is here and not in the app.
+#
+# 0777 rather than `chown frappe:frappe` on purpose: the same cache is
+# wanted by whatever user each supervisord program happens to run as
+# (backend, the queue workers and farmops-api are `frappe`; a `docker
+# exec` for a one-off bench command is often root), and a cache
+# directory only one of them can write is the same outage for the
+# others. Nothing secret is ever written there — it is a font index.
+#
+# Placed at the very bottom with the other cheap layers so it costs
+# nothing against the ~6 GB of app clones and `bench build` above.
+RUN mkdir -p /var/cache/fontconfig && \
+    chmod 777 /var/cache/fontconfig
+
 # Authoritative self-heal inventory (overrides the same keys set near the top
 # of this file). Placed down here so bumping it re-runs only the last few
 # cheap layers instead of the whole app-clone + bench-build chain.
