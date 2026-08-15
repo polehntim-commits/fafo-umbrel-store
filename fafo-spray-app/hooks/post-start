@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# post-start hook: add HiddenServicePort 7447 to Tor for direct iOS NOSTR
+# relay access over the .onion address.
+#
+# By default Umbrel maps port 80 of the hidden service to the app_proxy
+# (which fronts Flask on 5055). We append a second HiddenServicePort so
+# the SprayApp iPhone client can publish NOSTR events directly to the
+# relay without going through the HTTP proxy.
+
+TOR_CONTAINER="fafo-spray-app-tor_server-1"
+SERVER_HOST="fafo-spray-app_server_1"
+VIRTUAL_PORT="7447"
+SERVER_PORT="7447"
+TORRC="/tmp/torrc"
+LOG="[fafo-spray-app post-start]"
+
+echo "${LOG} Waiting for Tor container to initialise..."
+sleep 6
+
+is_running=$(docker inspect --format '{{.State.Running}}' "${TOR_CONTAINER}" 2>/dev/null) || {
+    echo "${LOG} Tor container not found — skipping HiddenServicePort injection"
+    exit 0
+}
+
+if [ "${is_running}" != "true" ]; then
+    echo "${LOG} Tor container exists but is not running — skipping"
+    exit 0
+fi
+
+if docker exec "${TOR_CONTAINER}" grep -q "HiddenServicePort ${VIRTUAL_PORT}" "${TORRC}" 2>/dev/null; then
+    echo "${LOG} HiddenServicePort ${VIRTUAL_PORT} already in torrc — nothing to do"
+    exit 0
+fi
+
+echo "${LOG} Appending: HiddenServicePort ${VIRTUAL_PORT} ${SERVER_HOST}:${SERVER_PORT}"
+docker exec "${TOR_CONTAINER}" sh -c \
+    "echo 'HiddenServicePort ${VIRTUAL_PORT} ${SERVER_HOST}:${SERVER_PORT}' >> ${TORRC}" || {
+    echo "${LOG} Failed to write to torrc — skipping reload"
+    exit 0
+}
+
+echo "${LOG} Sending SIGHUP to Tor to reload config..."
+docker kill --signal HUP "${TOR_CONTAINER}" || {
+    echo "${LOG} Failed to send HUP — Tor may not have reloaded"
+    exit 0
+}
+
+echo "${LOG} Done. iOS NOSTR relay reachable via .onion:${VIRTUAL_PORT}"

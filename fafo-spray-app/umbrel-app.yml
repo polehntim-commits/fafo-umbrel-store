@@ -1,0 +1,42 @@
+manifestVersion: 1
+id: fafo-spray-app
+name: Spray Compliance
+tagline: Zero-entry spray records for growers and packing houses
+icon: https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/fafo-spray-app/icon.png
+category: productivity
+version: "0.1.0-alpha"
+port: 5055
+description: >-
+  Spray event capture and compliance reporting for orchard and row-crop
+  growers. Replaces manual spray record entry with automatic, GPS-stamped,
+  label-validated compliance records deliverable to packing houses.
+
+  Hosts the forward-facing web front-end that is the onboarding surface
+  for growers and packing houses — grower self-registration, block and
+  crop entry, chemical inventory validated against a reference pesticide
+  registry, and live grower / packer dashboards showing incoming spray
+  events with their compliance verdicts.
+
+  The server also embeds a NOSTR relay so the companion iOS field app can
+  publish signed spray events directly to the Umbrel node over the farm
+  network (or via a Tor hidden service). No cloud dependency — the Umbrel
+  node is the canonical record holder. The web UI installs as a
+  Progressive Web App (PWA) on iPhone for a native-feel field experience.
+
+  This is an alpha release intended for demo and feedback.
+developer: Tim Polehn
+website: ""
+repo: https://github.com/polehntim-commits/fafo-umbrel-store
+support: https://github.com/polehntim-commits/fafo-umbrel-store/issues
+gallery:
+  - https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/fafo-spray-app/gallery/1.png
+  - https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/fafo-spray-app/gallery/2.png
+  - https://raw.githubusercontent.com/polehntim-commits/fafo-umbrel-store/main/fafo-spray-app/gallery/3.png
+dependencies: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+deterministicPassword: false
+torOnly: false
+submitter: Tim Polehn
+submission: https://github.com/polehntim-commits/fafo-umbrel-store

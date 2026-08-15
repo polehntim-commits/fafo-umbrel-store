@@ -1,8 +1,14 @@
-.DS_Store.claude/
+.DS_Store
+.claude/
 
 # farm_i9 is a separate git repo (github.com/polehntim-commits/farm_i9).
 # Kept here as a working copy but not tracked in fafo-umbrel-store.
 farm_i9/
+
+# farm_precision_ag is likewise its own git repo, kept here as a working
+# copy. Committing it from this repo would record a gitlink pointing at a
+# commit GitHub cannot resolve, so the directory would clone back empty.
+farm_precision_ag/
 
 # Runtime-generated credential file (fafo-erpnext entrypoint.sh writes it
 # to the container's sites/ volume, i.e. the Umbrel host, never here).

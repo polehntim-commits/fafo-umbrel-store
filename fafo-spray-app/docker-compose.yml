@@ -1,0 +1,50 @@
+services:
+  app_proxy:
+    environment:
+      APP_HOST: fafo-spray-app_server_1
+      APP_PORT: 5055
+    container_name: fafo-spray-app_app_proxy_1
+
+  server:
+    image: polehntim/spray-app:v0.1.0-alpha
+    container_name: fafo-spray-app_server_1
+    restart: on-failure
+    stop_grace_period: 1m
+    ports:
+      # 5056 on the host to avoid colliding with fafo-farm-app's 5001.
+      # The internal Flask port stays at 5055 so dev and Umbrel configs match.
+      - '5056:5055'
+      # Embedded NOSTR relay for iPhone spray event publish. Exposed on
+      # the local network only; for remote access use the Tor hidden
+      # service below.
+      - '7447:7447'
+    environment:
+      SPRAY_APP_DATA_DIR: /data
+      SPRAY_APP_SECRET: $APP_SEED
+      SPRAY_APP_HOST: '0.0.0.0'
+      SPRAY_APP_PORT: '5055'
+      SPRAY_APP_NOSTR_HOST: '0.0.0.0'
+      SPRAY_APP_NOSTR_PORT: '7447'
+      SPRAY_APP_DATABASE_URL: 'sqlite:////data/spray_events.db'
+      SPRAY_APP_DEVICE_ID: 'umbrel-spray-01'
+      SPRAY_APP_TOR_HS_DIR: '/tor_data'
+
+      PYTHONUNBUFFERED: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    volumes:
+      - ${APP_DATA_DIR}/data:/data
+      - ${TOR_DATA_DIR}/app-fafo-spray-app:/tor_data:ro
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    mem_limit: 384m
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:5055/api/meta']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
