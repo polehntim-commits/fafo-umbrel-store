@@ -167,6 +167,154 @@ BENCH_PY=/home/frappe/frappe-bench/env/bin/python
 # PDF export is one feature, not the app.
 mkdir -p /var/cache/fontconfig 2>/dev/null && chmod 777 /var/cache/fontconfig 2>/dev/null || true
 
+# ── farmops-api's nginx location block (2026-08-28) ───────────────
+# `/farmops/*` has to reach the farmops-api sidecar on 127.0.0.1:5250
+# — the WSGI service supervisord runs below, which serves
+# /farmops/api/mobile/* and /farmops/api/files/* for the Farm Ops iOS
+# app. Frappe's nginx knows nothing about it, so without this block
+# those URLs fall through to `location /`, get proxied to the Frappe
+# backend, and come back to the phone as the Desk's HTML login page —
+# the exact failure the sidecar exists to route around.
+#
+# WHY THIS IS A TEMPLATE PATCH AND NOT A conf.d DROP-IN. nginx only
+# accepts `location` inside a `server` block, and the sole server
+# block in this image is generated at RUNTIME: supervisord's
+# `frontend` program runs the base image's
+# /usr/local/bin/nginx-entrypoint.sh, which envsubst's
+# /templates/nginx/frappe.conf.template into
+# /etc/nginx/conf.d/frappe.conf and then starts nginx. Dropping a
+# file into conf.d/ puts it at http{} level — that is why
+# cache-control.conf works there, and it is also why a `location`
+# beside it is a config error rather than an addition. Hand-editing
+# the GENERATED frappe.conf is what we did before this commit: it
+# worked until the next restart regenerated the file from the
+# template and silently discarded the edit, which is a mobile outage
+# that no log mentions.
+#
+# So we patch the template, before supervisord ever starts. Both
+# `exec "$@"` paths below (fast path and first boot) come through
+# here, so every boot regenerates a frappe.conf that already contains
+# the block — including supervisord restarting the `frontend` program
+# on its own, since by then the template on disk is already patched.
+#
+# `$host`, `$remote_addr`, `$proxy_add_x_forwarded_for`, `$scheme`
+# and `$http_x_farmops_token` survive envsubst untouched:
+# nginx-entrypoint.sh hands envsubst an explicit variable list
+# (BACKEND, SOCKETIO, FRAPPE_SITE_NAME_HEADER, PROXY_READ_TIMEOUT,
+# …) and substitutes nothing outside it. The stock template depends
+# on that same behavior for its own `$host` lines.
+#
+# `^~` so a longest-prefix match on /farmops/ beats any regex
+# location, and `proxy_pass` carries no URI part, so the sidecar
+# receives the full path including the /farmops/ prefix — which is
+# what it routes on.
+FARMOPS_NGINX_TEMPLATE="${FARMOPS_NGINX_TEMPLATE:-/templates/nginx/frappe.conf.template}"
+FARMOPS_NGINX_UPSTREAM="${FARMOPS_NGINX_UPSTREAM:-127.0.0.1:5250}"
+FARMOPS_NGINX_BEGIN="# BEGIN farmops-api proxy — added by fafo-erpnext entrypoint.sh, do not hand-edit"
+FARMOPS_NGINX_END="# END farmops-api proxy"
+
+# Idempotent. Returns 0 when the template ends up containing the
+# block (already there, or inserted now), 1 when it does not — and it
+# NEVER touches the template unless the fully-rewritten copy passed
+# every check below, so a failure leaves nginx exactly as it was.
+# Callers invoke it in a `||` list, which also suspends `set -e` for
+# the duration: a broken proxy for one app must not stop the ERP from
+# booting.
+patch_nginx_template_for_farmops() {
+    local template="$FARMOPS_NGINX_TEMPLATE"
+    local block tmp before after expected
+
+    if [ ! -f "$template" ]; then
+        echo "[farmops-nginx] Template $template does not exist. The base image moved it, or this is not the frappe/erpnext image."
+        return 1
+    fi
+
+    if grep -qF "$FARMOPS_NGINX_BEGIN" "$template"; then
+        echo "[farmops-nginx] Block already present in $template — nothing to do."
+        return 0
+    fi
+
+    # The anchor. We insert immediately BEFORE `location / {`, the
+    # catch-all that would otherwise swallow /farmops/. Anchored on
+    # the structural line rather than a line number so a base-image
+    # template revision does not silently insert into the wrong place.
+    if ! grep -qE '^[[:space:]]*location[[:space:]]+/[[:space:]]*\{' "$template"; then
+        echo "[farmops-nginx] No 'location / {' anchor in $template — refusing to guess where the block goes."
+        return 1
+    fi
+
+    block="$(mktemp)" || return 1
+    tmp="$(mktemp)" || { rm -f "$block"; return 1; }
+
+    # Tabs, to match the indentation the stock template uses. Single
+    # quotes throughout so `$host` and friends reach nginx as nginx
+    # variables instead of being expanded by this shell.
+    {
+        printf '\t%s\n' "$FARMOPS_NGINX_BEGIN"
+        printf '\tlocation ^~ /farmops/ {\n'
+        printf '\t\tproxy_pass http://%s;\n' "$FARMOPS_NGINX_UPSTREAM"
+        printf '\t\tproxy_set_header Host $host;\n'
+        printf '\t\tproxy_set_header X-Real-IP $remote_addr;\n'
+        printf '\t\tproxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
+        printf '\t\tproxy_set_header X-Forwarded-Proto $scheme;\n'
+        printf '\t\tproxy_set_header X-FarmOps-Token $http_x_farmops_token;\n'
+        printf '\t\tproxy_read_timeout 30s;\n'
+        printf '\t}\n'
+        printf '\t%s\n' "$FARMOPS_NGINX_END"
+        printf '\n'
+    } > "$block"
+
+    before="$(wc -l < "$template")"
+    expected=$(( before + $(wc -l < "$block") ))
+
+    if ! awk -v blockfile="$block" '
+        !inserted && /^[ \t]*location[ \t]+[/][ \t]*[{]/ {
+            while ((getline line < blockfile) > 0) print line
+            close(blockfile)
+            inserted = 1
+        }
+        { print }
+    ' "$template" > "$tmp"; then
+        echo "[farmops-nginx] awk failed to rewrite $template — leaving it untouched."
+        rm -f "$block" "$tmp"
+        return 1
+    fi
+
+    # Validate the REWRITE, not the intent: exactly one copy of the
+    # block, the anchor still present, and no line lost or duplicated
+    # anywhere else in the file. Anything short of that and we throw
+    # the rewrite away rather than hand nginx a config we have not
+    # accounted for — a syntax error here is a restart loop on the
+    # `frontend` program, i.e. the whole site, not one endpoint.
+    after="$(wc -l < "$tmp")"
+    if [ "$(grep -cF "$FARMOPS_NGINX_BEGIN" "$tmp")" != "1" ] \
+       || [ "$(grep -cF "$FARMOPS_NGINX_END" "$tmp")" != "1" ] \
+       || [ "$(grep -cF 'location ^~ /farmops/' "$tmp")" != "1" ] \
+       || ! grep -qE '^[[:space:]]*location[[:space:]]+/[[:space:]]*\{' "$tmp" \
+       || [ "$after" != "$expected" ]; then
+        echo "[farmops-nginx] Rewrite of $template did not validate (${before} lines in, ${after} out, expected ${expected}) — discarding it and leaving the template untouched."
+        rm -f "$block" "$tmp"
+        return 1
+    fi
+
+    # `cat >` rather than `mv` so the template keeps its own inode,
+    # mode and ownership; mktemp's 0600 root-only file would be a
+    # different thing in the same path.
+    if ! cat "$tmp" > "$template"; then
+        echo "[farmops-nginx] Could not write $template — leaving it untouched."
+        rm -f "$block" "$tmp"
+        return 1
+    fi
+
+    rm -f "$block" "$tmp"
+    echo "[farmops-nginx] Inserted the /farmops/ -> ${FARMOPS_NGINX_UPSTREAM} location block into $template (before 'location / {'). nginx picks it up when supervisord regenerates /etc/nginx/conf.d/frappe.conf."
+    return 0
+}
+
+echo "[entrypoint] ── farmops-api nginx location block ──"
+patch_nginx_template_for_farmops \
+    || echo "[entrypoint] WARNING: the farmops-api nginx block is NOT installed. The Desk and every other route are unaffected; /farmops/* will answer the Farm Ops iOS app with the Desk login page until this is resolved. See the [farmops-nginx] line above for which check refused."
+
 # ── wait_for_mariadb [tries] ──────────────────────────────────────
 # Polls the DB port until it accepts TCP, then sleeps 3s so mysqld has
 # finished its own init and is actually answering auth (nc reports the
