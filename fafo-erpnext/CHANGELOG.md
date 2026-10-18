@@ -34,6 +34,18 @@ escalation, fixed ERPNext 15.121.0). None of the three apps adds a patch to
   healthy. It now runs nvm's `current` symlink, and the build fails if the
   base stops providing one.
 
+### Fixed — `supervisorctl restart all` never restarted nginx (2026-10-18)
+
+The base image's `nginx-entrypoint.sh` runs `nginx -g 'daemon off;'` without
+`exec`, so supervisord's stop signal reached only the wrapper shell. After
+every `supervisorctl restart all` (a step in every deploy) the old nginx master
+survived holding :8080 and kept serving with its old config, while the
+supervised `frontend` program crash-looped on "bind() to 0.0.0.0:8080 failed
+(98: Address already in use)" every ~2 s, indefinitely. Same on the v15.115
+image. `[program:frontend]` now has `stopasgroup=true` / `killasgroup=true`;
+verified: two `restart all` cycles, frontend stays RUNNING, zero bind errors.
+Found by the erp-backup kit's staged-upgrade test.
+
 ### Requires erpnext_mcp with the File-permission fix
 
 Frappe 15.12x checks write permission on the parent document inside
