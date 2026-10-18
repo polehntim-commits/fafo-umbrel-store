@@ -40,22 +40,29 @@
 # semantics, RAM isolation). Redis stays IN this container because
 # it's ephemeral cache — losing it on container restart is fine.
 #
-# Base image is `frappe/erpnext:v15.115.0` (Frappe Technologies'
-# official, has bench + all Python deps preinstalled). We just
-# layer supervisord, redis-server, and our config on top.
+# Base image is `frappe/erpnext:v15.123.0` (Frappe Technologies'
+# official, has bench + all Python deps preinstalled). It ships
+# Frappe v15.123.1 + ERPNext v15.123.0. We just layer supervisord,
+# redis-server, and our config on top.
+#
+# Pinned by tag AND digest (2026-10-18). The digest makes a rebuild
+# of this Dockerfile reproduce the same Frappe/ERPNext code even if
+# upstream re-pushes the tag; bumping the base means changing both.
+# Previous base: v15.115.0 (Frappe 15.113.4) — see CHANGELOG.md,
+# "Base image v15.123.0" (2026-10-18).
 #
 # Apps baked into the image (cloned at build time so they survive
 # container recreates — Umbrel bind-mounts sites/ but not apps/):
 #   * agriculture — frappe/agriculture (branch develop)
 #   * farm_i9     — polehntim-commits/farm_i9 (branch main), the
 #                   US-compliance layer (workspace: Farm HR)
-#   * hrms        — frappe/hrms (branch version-15), Frappe HR +
+#   * hrms        — frappe/hrms (tag HRMS_REF, v15.64.5), Frappe HR +
 #                   Payroll framework that farm_i9 rides on top of
 #   * farm_precision_ag — polehntim-commits/farm_precision_ag (branch
 #                   main), precision-ag suite (Phase B: USDA Market
 #                   Pricing; Land/Blocks/Spray/IPM/Costing follow)
 
-FROM frappe/erpnext:v15.115.0
+FROM frappe/erpnext:v15.123.0@sha256:ad1f567771a87961c20f1516df6b11228a3eac31cfba00d358b23803b7b44f4b
 
 # Self-heal advertisement — lets an operator confirm at a glance
 # (`docker inspect`) that this image carries the runtime recovery
@@ -70,6 +77,21 @@ LABEL org.polehnfarm.self-heal="asset-canary,healthcheck,app-reconcile"
 LABEL org.polehnfarm.self-heal.version="1"
 
 USER root
+
+# ── Restore the `frappe` group (base image v15.123.0, 2026-10-18) ─
+# Up to v15.115.0 the base image's frappe user was uid 1000 / gid
+# 1000(frappe). From the v15.12x images it is uid 1000 / gid 0(root),
+# and there is NO group named `frappe` at all — so every
+# `chown frappe:frappe` in this Dockerfile, entrypoint.sh and
+# asset_floor.py fails with "invalid group". At build time that kills
+# the asset-snapshot layer; at runtime the `|| true` guards would hide
+# it and leave new files group-owned by root.
+#
+# Re-adding the group at gid 1000 (free in the new image) makes those
+# calls mean what they always meant, and keeps new files in line with
+# what every existing sites volume already holds (1000:1000). The
+# user's primary group is deliberately left as upstream set it.
+RUN getent group frappe >/dev/null || groupadd -g 1000 frappe
 
 # Install supervisord to orchestrate the multiple Frappe processes,
 # plus redis-server (bundled inside the container so we stay one
@@ -177,13 +199,15 @@ RUN cd /home/frappe/frappe-bench && \
      fi)
 USER root
 
-# ── Cache-bust when frappe/hrms version-15 branch advances ────────
-# Same pattern as farm_i9 and agriculture above — GitHub's commits
-# endpoint returns the current HEAD SHA in the response body, which
-# Docker uses as a cache key. When Frappe pushes fixes to
-# version-15, Tim's next `docker build` invalidates this layer and
-# every layer below it, forcing a fresh clone + install.
-ADD https://api.github.com/repos/frappe/hrms/commits/version-15 /tmp/.hrms_head.json
+# ── frappe/hrms is pinned to a release tag (2026-10-18) ───────────
+# It used to track the version-15 branch HEAD, which meant the HRMS
+# in the image was whatever HEAD happened to be at build time — not
+# something a rollback note or an advisory check can name. It is now
+# a tag, bumped deliberately alongside the base image above. The
+# commits endpoint accepts a tag as the ref, so the cache key still
+# changes when HRMS_REF does.
+ARG HRMS_REF=v15.64.5
+ADD https://api.github.com/repos/frappe/hrms/commits/${HRMS_REF} /tmp/.hrms_head.json
 
 # ── Bake frappe/hrms into the image ───────────────────────────────
 # Frappe Technologies' official HR + Payroll app. Layers Employee,
@@ -192,14 +216,14 @@ ADD https://api.github.com/repos/frappe/hrms/commits/version-15 /tmp/.hrms_head.
 # farm_i9 (workspace: Farm HR) rides on top of these DocTypes for
 # US-specific compliance (I-9, W-4, W-2, etc.).
 #
-# Version-15 branch matches the ERPNext v15.115.0 base image. Two-
+# HRMS_REF is a v15 tag matching the ERPNext v15.123.0 base image. Two-
 # step install (get-app + explicit pip install -e) matches the
 # farm_i9 and agriculture blocks — bench get-app has a silent-fail
 # pip step, so we always follow with an explicit pip install to
 # guarantee the app is importable at runtime.
 USER frappe
 RUN cd /home/frappe/frappe-bench && \
-    (bench get-app --branch version-15 hrms https://github.com/frappe/hrms.git \
+    (bench get-app --branch ${HRMS_REF} hrms https://github.com/frappe/hrms.git \
      || echo "[dockerfile] hrms get-app failed at build — will attempt pip install anyway") && \
     (if [ -d apps/hrms ]; then \
         env/bin/pip install -e apps/hrms --force-reinstall --no-deps \
@@ -321,6 +345,10 @@ RUN mkdir -p /home/frappe/frappe-bench/logs && \
 
 # Supervisord process definitions + our first-boot entrypoint.
 COPY supervisord.conf /etc/supervisor/conf.d/erpnext.conf
+# supervisord.conf's websocket program runs nvm's `current` node. Fail the
+# build here if the base image stops providing it (see the note there).
+RUN test -x /home/frappe/.nvm/current/bin/node && \
+    /home/frappe/.nvm/current/bin/node --version
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
@@ -410,7 +438,7 @@ VOLUME ["/home/frappe/frappe-bench/sites"]
 # hardcode, but assets.json always lives at a fixed path and is the
 # exact file wiped by `clear-website-cache`. `curl -f` makes any
 # non-2xx status count as failure. `curl` is already present in the
-# base frappe/erpnext:v15.115.0 image (no apt install needed). Grace
+# base frappe/erpnext image (no apt install needed). Grace
 # period of 5 min accommodates cold-boot bench new-site +
 # agriculture/farm_i9 install.
 #

@@ -1,5 +1,56 @@
 # Changelog — fafo-erpnext
 
+## Base image v15.123.0 (2026-10-18)
+
+Security bump of the framework underneath every app in the image. No change
+to the Umbrel app version or the compose file; the deploy is the usual image
+pull + `bench migrate` + `supervisorctl restart all`.
+
+| | was (OML, 2026-10-18) | now |
+|---|---|---|
+| Base image | `frappe/erpnext:v15.115.0` | `frappe/erpnext:v15.123.0@sha256:ad1f5677…` |
+| Frappe | 15.113.4 | 15.123.1 |
+| ERPNext | 15.115.0 | 15.123.0 |
+| HRMS | 15.64.3 (version-15 HEAD at build time) | 15.64.5 (pinned tag, `HRMS_REF`) |
+| Python / Node | 3.11.6 / 20.19.2 | 3.11.17 / 22.23.3 |
+
+Closes the Frappe and ERPNext advisories published since 15.113.4 / 15.115.0,
+including two criticals that are reachable by ANY logged-in account (every
+FarmOps phone login is one): GHSA-9pp9-wgp9-3p3j (file-upload path traversal
+to RCE, fixed 15.121.0) and GHSA-v38v-9h2p-hr8v (SQL injection to privilege
+escalation, fixed ERPNext 15.121.0). None of the three apps adds a patch to
+`patches.txt` across these ranges, so the migrate is schema sync only.
+
+### Fixed — two things the new base image changed underneath us
+
+* **No `frappe` group.** The v15.12x base images make the frappe user
+  uid 1000 / gid 0(root) and drop the `frappe` group entirely, so every
+  `chown frappe:frappe` (Dockerfile, entrypoint.sh, asset_floor.py) failed
+  with "invalid group" — the asset-snapshot layer killed the build. The
+  Dockerfile re-adds `frappe` at gid 1000, which is what every existing
+  sites volume is already owned by.
+* **Node moved 20.19.2 → 22.23.3.** supervisord.conf hard-coded the old
+  node path, which left the realtime websocket FATAL with everything else
+  healthy. It now runs nvm's `current` symlink, and the build fails if the
+  base stops providing one.
+
+### Requires erpnext_mcp with the File-permission fix
+
+Frappe 15.12x checks write permission on the parent document inside
+`File.validate` (unless `flags.ignore_permissions`). erpnext_mcp's
+`tools/files.py:insert_attachment` inserts without that flag after doing its
+own parent check, so mobile attaches by users without Desk write on the
+parent are refused. Build this image only with an erpnext_mcp that sets the
+flag on that path.
+
+### Rehearsed
+
+Fresh site on the previous image → this image → `bench migrate` (exit 0,
+~25 s on an empty site) → `supervisorctl restart all`: all nine programs
+RUNNING, healthcheck healthy, Desk / assets / socket.io / farmops health 200,
+and the bench suite for erpnext_mcp showed no new failures against the
+previous image's baseline.
+
 ## 15.1.2
 
 Self-healing for the two outages that hit a production Umbrel on 2026-07-26:
