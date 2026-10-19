@@ -8,19 +8,26 @@
 #   upgrade:        sudo bash erp-backup-kit.sh primary|secondary      (names and hosts come from the existing conf)
 #   Legacy aliases: "oml" = primary (me=oml, peer=umbrellocal); "umbrellocal" = secondary (the reverse).
 #   Other options:  --root=DIR (default /home/umbrel/umbrel)  --container=NAME (default fafo-erpnext_server_1)
+#                   --no-wait (refuse instead of waiting while a backup / push / restore runs)  --force (install anyway)
+#
+# SAFE WHILE JOBS RUN (2026-10-19.3): every script is written to a staging dir and moved into bin/ with rename(2),
+# so a script that is running keeps reading its old file (bash reads scripts incrementally; kits before .3 wrote in
+# place, which is how a running push died with "syntax error near unexpected token" on 2026-10-19). The installer
+# also waits while any erp-* job runs (or refuses with --no-wait), pauses the timers while it writes, and re-arms them.
 #
 # Installs into <root>/erp-backup/. Safe to re-run: scripts are refreshed; an existing erp-backup.conf is kept
 # (new keys are appended; change values with bin/set-conf.sh). Never edits app compose files or app-data, never
 # restarts the ERPNext containers, never writes secrets to disk. Hosts, names and paths live only in the conf.
 set -euo pipefail
-KIT_VERSION="2026-10-19.2"
+KIT_VERSION="2026-10-19.3"
 
 ROLE="${1:-}"; [ $# -gt 0 ] && shift
-ARG_ME=""; ARG_PEER=""; ARG_PEER_HOST=""; ARG_PRIMARY_HOSTNAME=""; ARG_CONTAINER=""
+ARG_ME=""; ARG_PEER=""; ARG_PEER_HOST=""; ARG_PRIMARY_HOSTNAME=""; ARG_CONTAINER=""; FORCE_INSTALL=0; NO_WAIT=0
 for a in "$@"; do case "$a" in
   --me=*) ARG_ME="${a#--me=}";; --peer=*) ARG_PEER="${a#--peer=}";; --peer-host=*) ARG_PEER_HOST="${a#--peer-host=}";;
   --primary-hostname=*) ARG_PRIMARY_HOSTNAME="${a#--primary-hostname=}";; --container=*) ARG_CONTAINER="${a#--container=}";;
   --root=*) ERP_KIT_ROOT="${a#--root=}";;
+  --force) FORCE_INSTALL=1;; --no-wait) NO_WAIT=1;;
   *) echo "unknown option $a"; exit 1;; esac; done
 ROOT_DIR="${ERP_KIT_ROOT:-/home/umbrel/umbrel}"        # Umbrel's persistent data dir
 UMBREL_HOME="${ERP_KIT_UMBREL_HOME:-/home/umbrel}"     # home of the user peers push as
@@ -72,7 +79,44 @@ umask 077
 mkdir -p "$BASE"/bin "$BASE"/systemd "$BASE"/keys "$BASE"/state "$BASE"/standby "$BASE"/work/standby \
          "$BASE"/own/daily "$BASE"/own/weekly "$BASE"/own/receipts "$BASE"/restore-tests
 chmod 700 "$BASE" "$BASE/keys" "$BASE/work" "$BASE/standby"
-echo "$KIT_VERSION" > "$BASE/KIT_VERSION"
+
+# ---------------------------------------------------------------- wait until nothing is running
+SDIR_SYS="${ERP_KIT_SYSTEMD_DIR:-/etc/systemd/system}"
+self_or_ancestor() { local q="$$"; while [ -n "$q" ] && [ "$q" -ge 1 ] 2>/dev/null; do [ "$q" = "$1" ] && return 0; [ "$q" = 1 ] && break; q=$(awk '/^PPid:/{print $2}' "/proc/$q/status" 2>/dev/null); done; return 1; }
+busy_now() { # prints what is running, empty if nothing
+  local u f p out=""
+  for u in erp-backup erp-push erp-standby erp-recv-check erp-offsite erp-scrub erp-watchdog; do
+    systemctl is-active --quiet "$u.service" 2>/dev/null && out="$out $u.service"
+  done
+  for f in .lock .push.lock .standby.lock .offsite.lock .scrub.lock .stage.lock; do
+    [ -e "$BASE/$f" ] || continue
+    exec 7>>"$BASE/$f"; flock -n 7 || out="$out $f"; exec 7>&-
+  done
+  if command -v pgrep >/dev/null 2>&1; then
+    for p in $(pgrep -f "$BASE/bin/[a-z-]+\.sh" 2>/dev/null || true); do
+      self_or_ancestor "$p" && continue
+      [ -d "/proc/$p" ] && out="$out $(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -oE "bin/[a-z-]+\.sh" | head -n1)"
+    done
+  fi
+  echo "${out# }"
+}
+if [ -d "$BASE/bin" ] && [ -n "$(ls -A "$BASE/bin" 2>/dev/null)" ]; then
+  W=0; WMAX=$(( ${INSTALL_WAIT_MIN:-360} * 60 ))
+  while B_NOW=$(busy_now); [ -n "$B_NOW" ]; do
+    if [ "$FORCE_INSTALL" = 1 ]; then echo "Running: $B_NOW - installing anyway (--force; running scripts keep their old files)"; break; fi
+    [ "$NO_WAIT" = 1 ] && { echo "Refusing: erp-backup jobs are running ($B_NOW). Re-run when they finish, or without --no-wait to wait."; exit 1; }
+    [ "$W" -ge "$WMAX" ] && { echo "Still running after ${INSTALL_WAIT_MIN:-360} min ($B_NOW). Not installing."; exit 1; }
+    [ $(( W % 300 )) = 0 ] && echo "$(date -Is) waiting for running erp-backup jobs to finish before installing: $B_NOW ($((W / 60)) min so far; Ctrl-C to stop, --force to install anyway)"
+    sleep 15; W=$((W + 15))
+  done
+fi
+# pause the timers while files change (a job starting halfway through an install would mix versions)
+TIMERS_WERE=""
+for t in erp-backup erp-standby erp-recv-check erp-offsite erp-scrub erp-watchdog erp-progress; do
+  if systemctl is-active --quiet "$t.timer" 2>/dev/null; then TIMERS_WERE="$TIMERS_WERE $t"; systemctl stop "$t.timer" >/dev/null 2>&1 || true; fi
+done
+NB="$BASE/.bin.new.$$"; rm -rf "$NB"; mkdir -p "$NB"; chmod 700 "$NB"
+trap 'rm -rf "$NB"; for t in $TIMERS_WERE; do systemctl start "$t.timer" >/dev/null 2>&1 || true; done' EXIT
 
 # ---------------------------------------------------------------- config (create, or append missing keys)
 CONF="$BASE/erp-backup.conf"
@@ -128,8 +172,13 @@ addconf STATUS_TO_CONTAINER 1
 addconf NOTIFY_URL '""'
 addconf NOTIFY_REPEAT_HOURS 24
 addconf WATCHDOG_TIME "$WATCHDOG_TIME"
-addconf STANDBY_WAIT_MIN 150
+addconf STANDBY_WAIT_MIN 240
 addconf PUSH_WAIT_MIN 300
+addconf PUSH_BWLIMIT_KBPS 0
+addconf DELTA_STANDBY 1
+addconf PUSH_RESUME_AFTER_MIN 60
+addconf PUSH_RESUME_MAX_PER_DAY 6
+addconf LINK_MIN_RATE_KBPS 1000
 addconf PUSH_TRANSPORT ssh
 addconf PEER_LOCAL_DIR '""'
 addconf PEER_STATUS_TO_CONTAINER 0
@@ -146,7 +195,7 @@ addconf STAGE_PORT 8090
 addconf STAGE_MIN_AVAIL_MB 3500
 
 # ---------------------------------------------------------------- common.sh (shared helpers)
-cat > "$BASE/bin/common.sh" <<'EOF_COMMON'
+cat > "$NB/common.sh" <<'EOF_COMMON'
 # sourced by every erp-backup script
 _BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$_BIN_DIR/../erp-backup.conf"
@@ -160,7 +209,14 @@ DOCTYPES=("GL Entry" "Journal Entry" "Sales Invoice" "Purchase Invoice" "Payment
 log()    { echo "$(date -Is) [$ME/$STAGE] $*"; }
 status() { echo "$(date -Is) $*" >> "$STATUS"; }
 notify() { if [ -n "${NOTIFY_URL:-}" ]; then curl -fsS -m 10 -d "[$ME] $*" "$NOTIFY_URL" >/dev/null 2>&1 || true; fi; }
-die()    { log "FAIL: $*"; status "FAIL $STAGE $*"; notify "FAIL $STAGE $*"; state_fail "$STAGE" "$*"; report_quiet; exit 1; }
+die()    { log "FAIL: $*"; status "FAIL $STAGE $*"; notify "FAIL $STAGE $*"; state_fail "$STAGE" "$*"; prog end FAIL "$*"; report_quiet; exit 1; }
+# live progress (progress.py): prog begin PHASE STEP SET [--total BYTES] [--expect SECONDS] | prog bytes N [TOTAL] | prog end RESULT [NOTE]
+prog() { ERPB_STATE="$STATE" ERPB_ME="$ME" ERPB_PEER="$PEER_NAME" ERPB_RECV_DIR="${RECV_DIR:-}" ERPB_REPORT="$_BIN_DIR/report.sh" \
+           python3 "$_BIN_DIR/progress.py" "$@" 2>/dev/null || true; }
+PROG_WATCH_PID=""
+prog_watch()   { ERPB_STATE="$STATE" ERPB_ME="$ME" ERPB_REPORT="$_BIN_DIR/report.sh" python3 "$_BIN_DIR/progress.py" watchdir "$1" "$2" 5 >/dev/null 2>&1 & PROG_WATCH_PID=$!; }
+prog_unwatch() { [ -n "$PROG_WATCH_PID" ] && kill "$PROG_WATCH_PID" 2>/dev/null; PROG_WATCH_PID=""; return 0; }
+bytes_of() { du -sb "$@" 2>/dev/null | awk '{s+=$1} END{print s+0}'; }
 need_root() { [ "$(id -u)" = 0 ] || { echo "Run with sudo."; exit 1; }; }
 setconf() { sed -i "s|^$1=.*|$1=$2|" "$BASE/erp-backup.conf"; }
 # state_put STAGE k=v k=v ... (replaces the stage's state file; values must be single-line)
@@ -176,15 +232,15 @@ state_fail() {
 report_quiet() { bash "$_BIN_DIR/report.sh" >/dev/null 2>&1 || true; }
 prune_keep() { # prune_keep DIR N : keep newest N subdirs (names sort by date)
   [ -d "$1" ] || return 0
-  find "$1" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' | sort | head -n -"$2" | xargs -r rm -rf --
+  find "$1" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' ! -name '.*' | sort | head -n -"$2" | xargs -r rm -rf --
 }
-newest_dir() { find "$1" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' 2>/dev/null | sort | tail -n1; }
+newest_dir() { find "$1" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' ! -name '.*' 2>/dev/null | sort | tail -n1; }
 # A set is COMPLETE only once its marker file is there. Senders push every other file first and the marker
 # last (push.sh), so a set that was cut off mid-transfer never looks complete. Never pick a set by name alone.
 #   newest_complete DIR MARKER   -> newest complete set dir (empty if none)
 #   incomplete_sets DIR MARKER   -> names of set dirs without the marker, oldest first
-newest_complete() { local d; for d in $(find "$1" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' 2>/dev/null | sort -r); do [ -f "$d/$2" ] && { echo "$d"; return 0; }; done; return 0; }
-incomplete_sets() { local d; for d in $(find "$1" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' 2>/dev/null | sort); do [ -f "$d/$2" ] || basename "$d"; done; return 0; }
+newest_complete() { local d; for d in $(find "$1" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' ! -name '.*' 2>/dev/null | sort -r); do [ -f "$d/$2" ] && { echo "$d"; return 0; }; done; return 0; }
+incomplete_sets() { local d; for d in $(find "$1" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' ! -name '.*' 2>/dev/null | sort); do [ -f "$d/$2" ] || basename "$d"; done; return 0; }
 dir_age_min() { echo $(( ( $(date +%s) - $(stat -c %Y "$1") ) / 60 )); }
 # Where pushes go. PUSH_TRANSPORT=ssh (default): the peer's write-only rrsync jail over the tailnet.
 # PUSH_TRANSPORT=local: a directory on this machine (PEER_LOCAL_DIR) - single-box installs, a USB disk, tests.
@@ -292,6 +348,7 @@ init_ssh() { # SSH_ARGS (array, for ssh) and RSYNC_RSH (string, for rsync -e)
   read -r -a SSH_ARGS <<<"$base"
   RSYNC_RSH="ssh $base"
   if [ -n "$px" ]; then SSH_ARGS+=(-o "ProxyCommand=$px"); RSYNC_RSH="$RSYNC_RSH -o 'ProxyCommand=$px'"; fi
+  [ -n "${ERP_KIT_TEST_RSH:-}" ] && RSYNC_RSH="$ERP_KIT_TEST_RSH"   # tests only: a stand-in ssh that runs the real rrsync jail
 }
 peer_banner() { # first line the peer's sshd sends, via the same path SSH will use (empty if unreachable)
   local c
@@ -304,11 +361,50 @@ peer_banner() { # first line the peer's sshd sends, via the same path SSH will u
 }
 peer_reachable() { peer_banner | grep -q '^SSH-'; }
 link_desc() { echo "mode=$(link_mode) ts_container=$(find_ts_container || true)${TS_SOCKET:+ socket=$TS_SOCKET}"; }
+# link_probe: how packets to the peer travel (2026-10-19.3). Prints k=v lines: path=direct|derp|unknown derp=<region>
+# endpoint=<ip:port> ping_ms tun=yes|no (no = userspace networking / netstack) online. Read-only; ~10 s.
+link_probe() {
+  local mode c st pg tsx=()
+  mode=$(link_mode)
+  if [ "$mode" = container ]; then c=$(find_ts_container); [ -n "$c" ] || { echo "path=unknown"; return 0; }; tsx=(docker exec "$c" tailscale ${TS_SOCKET:+--socket=$TS_SOCKET})
+  elif [ "$mode" = direct ] && command -v tailscale >/dev/null; then tsx=(tailscale)
+  else echo "path=unknown"; return 0; fi
+  st=$(timeout 20 "${tsx[@]}" status --json 2>/dev/null || true)
+  pg=$(timeout 30 "${tsx[@]}" ping -c 3 --timeout 5s "$PEER_HOST" 2>&1 | tail -n 3 || true)
+  ERPB_PEER_HOST="$PEER_HOST" python3 - "$st" "$pg" <<'PY'
+import json, os, re, sys
+st, pg, host = sys.argv[1], sys.argv[2], os.environ["ERPB_PEER_HOST"]
+out = {"path": "unknown"}
+try:
+    d = json.loads(st); out["tun"] = "yes" if d.get("TUN") else "no"
+    for p in (d.get("Peer") or {}).values():
+        names = [p.get("HostName", ""), (p.get("DNSName") or "").split(".")[0]] + (p.get("TailscaleIPs") or [])
+        if host in names or any(n and host.startswith(n + ".") for n in names[:2]):
+            out["online"] = "yes" if p.get("Online") else "no"
+            if p.get("CurAddr"): out.update(path="direct", endpoint=p["CurAddr"])
+            elif p.get("Relay"): out.update(path="derp", derp=p["Relay"])
+            break
+except Exception: pass
+m = re.findall(r"via (DERP\(([^)]+)\)|[\[\]0-9a-fA-F.:]+:\d+) in ([\d.]+)ms", pg)
+if m:
+    v, region, ms = m[-1]; out["ping_ms"] = ms
+    if v.startswith("DERP"): out.update(path="derp", derp=region)
+    else: out.update(path="direct", endpoint=v)
+for k, v in out.items(): print(f"{k}={v}")
+PY
+}
 EOF_COMMON
 
 # ---------------------------------------------------------------- lib-site.sh (restore/standby helpers)
-cat > "$BASE/bin/lib-site.sh" <<'EOF_LIB'
+cat > "$NB/lib-site.sh" <<'EOF_LIB'
 # sourced by standby-*, archive-test, promote, demote, fence
+keep_basis() { # the set just restored becomes standby/.basis (the peer sends tomorrow's set as a delta against it);
+  # everything else up to and including it, by name, goes
+  local set="$1" d
+  if [ "${DELTA_STANDBY:-1}" = 1 ]; then rm -rf "$RECV_DIR/standby/.basis"; mv "$set" "$RECV_DIR/standby/.basis"; else rm -rf "$RECV_DIR/standby/.basis"; fi
+  for d in $(find "$RECV_DIR/standby" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' ! -name '.*' | sort); do [[ "$(basename "$d")" > "$(basename "$set")" ]] || rm -rf "$d"; done
+  return 0
+}
 copy_set_in() { # copy_set_in HOSTDIR -> $TMPD in container
   docker exec -u root "$CONTAINER" sh -c "rm -rf '$TMPD' && mkdir -p '$TMPD'"
   docker cp "$1/." "$CONTAINER:$TMPD/" >/dev/null 2>&1 || die "docker cp into container failed"
@@ -519,15 +615,27 @@ drop_test_site() { # only ever drops sites named restoretest
   bx sh -c 'bench drop-site "$TS" --db-root-password "$DBPW" --no-backup --force' || die "drop-site failed"
   docker exec -u root "$CONTAINER" sh -c "rm -rf '$BENCH'/archived_sites/${TS}*"
 }
-mem_snapshot() { # sets MEM_AVAIL_MB, SWAP_PCT from /proc/meminfo
-  local f="${ERP_MEMINFO:-/proc/meminfo}" a st sf
+# Memory pre-check (2026-10-19.3). The test is MemAvailable from /proc/meminfo (what the kernel can hand out
+# without swapping; NOT "free"). Swap that is merely OCCUPIED is not pressure: pages swapped out days ago and never
+# touched again sit there harmlessly (seen on a standby box: 3.5 GiB available with 4.1 GiB of swap used). So a high swap
+# percentage only defers a restore when swap is ACTIVE: swap-ins in a short sample, or memory PSI stall.
+mem_snapshot() { # sets MEM_AVAIL_MB, SWAP_PCT, SWAPIN_PS (pages/s over MEM_SAMPLE_S), PSI_SOME10
+  local f="${ERP_MEMINFO:-/proc/meminfo}" v="${ERP_VMSTAT:-/proc/vmstat}" a st sf i1 i2
   a=$(awk '/^MemAvailable:/{print $2}' "$f"); st=$(awk '/^SwapTotal:/{print $2}' "$f"); sf=$(awk '/^SwapFree:/{print $2}' "$f")
   MEM_AVAIL_MB=$(( ${a:-0} / 1024 )); SWAP_PCT=0
   [ "${st:-0}" -gt 0 ] && SWAP_PCT=$(( (st - sf) * 100 / st ))
+  SWAPIN_PS=0
+  if [ "$SWAP_PCT" -gt 0 ] && [ -r "$v" ]; then
+    i1=$(awk '/^pswpin /{print $2}' "$v"); sleep "${MEM_SAMPLE_S:-5}"; i2=$(awk '/^pswpin /{print $2}' "$v")
+    SWAPIN_PS=$(( ( ${i2:-0} - ${i1:-0} ) / ${MEM_SAMPLE_S:-5} ))
+  fi
+  PSI_SOME10=$(awk '/^some/{for(i=1;i<=NF;i++) if($i ~ /^avg10=/){sub("avg10=","",$i); print $i}}' "${ERP_PSI:-/proc/pressure/memory}" 2>/dev/null || true)
+  PSI_SOME10="${PSI_SOME10:-0}"
   return 0
 }
-mem_ok() { mem_snapshot; [ "$MEM_AVAIL_MB" -ge "${STANDBY_MIN_AVAIL_MB:-2500}" ] && [ "$SWAP_PCT" -le "${STANDBY_MAX_SWAP_PCT:-80}" ]; }
-mem_desc() { echo "MemAvailable ${MEM_AVAIL_MB} MB (need >= ${STANDBY_MIN_AVAIL_MB:-2500}), swap ${SWAP_PCT}% used (max ${STANDBY_MAX_SWAP_PCT:-80}%)"; }
+swap_active() { [ "$SWAPIN_PS" -ge "${STANDBY_MAX_SWAPIN_PS:-50}" ] || awk -v p="$PSI_SOME10" -v m="${STANDBY_MAX_PSI:-10}" 'BEGIN{exit !(p+0 >= m+0)}'; }
+mem_ok() { mem_snapshot; [ "$MEM_AVAIL_MB" -ge "${STANDBY_MIN_AVAIL_MB:-2500}" ] || return 1; [ "$SWAP_PCT" -le "${STANDBY_MAX_SWAP_PCT:-80}" ] && return 0; ! swap_active; }
+mem_desc() { echo "MemAvailable ${MEM_AVAIL_MB} MB (need >= ${STANDBY_MIN_AVAIL_MB:-2500}), swap ${SWAP_PCT}% used ($( [ "$SWAP_PCT" -le "${STANDBY_MAX_SWAP_PCT:-80}" ] && echo "under ${STANDBY_MAX_SWAP_PCT:-80}%" || { swap_active && echo "ACTIVE: ${SWAPIN_PS} swap-ins/s, PSI ${PSI_SOME10}" || echo "idle: ${SWAPIN_PS} swap-ins/s, PSI ${PSI_SOME10} - not counted"; }))"; }
 standby_due() { # weekly: due on STANDBY_DAY, or after a deferral/failure, or if the last good refresh is > 8 days old
   [ "${STANDBY_EVERY:-daily}" = weekly ] || return 0
   [ -f "$STATE/standby_defer.env" ] && return 0
@@ -566,14 +674,14 @@ defer_standby() { # record a skipped refresh (not a failure) and exit cleanly
 }
 write_receipt() { # write_receipt SET SITE DURATION METHOD : "your backup set X was restored here and checked" (for the peer)
   cat > "$BASE/own/receipts/standby-of-$PEER_NAME.json" <<JSON
-{"restored_by":"$ME","restored_on_host":"$(hostname)","data_of":"$PEER_NAME","set":"$1","site":"$2","at":"$(date -Is)","duration_s":$3,"method":"$4","job":"OK","check":"$CHK_RESULT","result":"$CHK_RESULT","counts_ok":"$CHK_COUNTS_OK","files":"$CHK_PUBN/$CHK_PUBA,$CHK_PRIVN/$CHK_PRIVA","files_missing":${CHK_MISSING:-0},"files_extra":${CHK_EXTRA:-0},"secrets":"$CHK_SECRETS","decrypt_fail":"$CHK_DECRYPT_FAIL","sanity_ok":"$CHK_SANITY_OK","kit":"$(cat "$BASE/KIT_VERSION" 2>/dev/null)"}
+{"restored_by":"$ME","restored_on_host":"$(hostname)","data_of":"$PEER_NAME","set":"$1","site":"$2","at":"$(date -Is)","duration_s":$3,"method":"$4","job":"OK","check":"$CHK_RESULT","result":"$CHK_RESULT","counts_ok":"$CHK_COUNTS_OK","files":"$CHK_PUBN/$CHK_PUBA,$CHK_PRIVN/$CHK_PRIVA","files_missing":${CHK_MISSING:-0},"files_extra":${CHK_EXTRA:-0},"secrets":"$CHK_SECRETS","decrypt_fail":"$CHK_DECRYPT_FAIL","sanity_ok":"$CHK_SANITY_OK","kit":"$(cat "$BASE/KIT_VERSION" 2>/dev/null)","waited_for_push_s":${WAITED:-0},"progress":{"restore_s":$3,"set_bytes":$(bytes_of "$RECV_DIR/standby/$1" "$RECV_DIR/standby/.basis" | head -n1)}}
 JSON
 }
 confirm_word() { local w; read -rp "Type $1 to continue: " w; [ "$w" = "$1" ] || die "not confirmed"; }
 EOF_LIB
 
 # ---------------------------------------------------------------- get-age.sh
-cat > "$BASE/bin/get-age.sh" <<'EOF_GETAGE'
+cat > "$NB/get-age.sh" <<'EOF_GETAGE'
 #!/bin/bash
 # Install the age encryption tool (static binary, pinned v1.3.1, checksum-verified) into erp-backup/bin.
 set -euo pipefail
@@ -597,7 +705,7 @@ log "installed $("$BASE/bin/age" --version) ($A), checksum verified"
 EOF_GETAGE
 
 # ---------------------------------------------------------------- set-recipient.sh
-cat > "$BASE/bin/set-recipient.sh" <<'EOF_RCPT'
+cat > "$NB/set-recipient.sh" <<'EOF_RCPT'
 #!/bin/bash
 # Store the PUBLIC age recipient (age1...) used to encrypt archives. The private key never comes to this box.
 set -euo pipefail
@@ -616,7 +724,7 @@ echo "Archive recipient set: ${R:0:16}...${R: -6}  (public key only; this box ca
 EOF_RCPT
 
 # ---------------------------------------------------------------- backup.sh
-cat > "$BASE/bin/backup.sh" <<'EOF_BACKUP'
+cat > "$NB/backup.sh" <<'EOF_BACKUP'
 #!/bin/bash
 # Nightly: bench backup --with-files -> verify -> encrypted archive in own/daily/<stamp>
 #          (+ plaintext standby set in work/standby/<stamp> for the peer's warm standby) -> weekly link -> prune
@@ -646,7 +754,10 @@ export TS="$SITE"
 SRC_COUNTS=$(site_counts "$SITE" || true)
 SRC_SANITY=$(site_sanity "$SITE" || true)
 log "bench --site $SITE backup --with-files  (container $CONTAINER, data origin $ORIGIN)"
+prog begin backup "bench backup (dump + tar inside ERPNext)" "$STAMP" --expect "$(state_get backup bench_s)"
+TB=$SECONDS
 docker exec -u frappe -w "$BENCH" "$CONTAINER" bench --site "$SITE" backup --with-files >/dev/null || die "bench backup failed"
+BENCH_S=$((SECONDS - TB))
 
 NEWEST=$(docker exec "$CONTAINER" sh -c "ls -1t '$BK'/*-database.sql.gz 2>/dev/null | head -n1" || true)
 [ -n "$NEWEST" ] || die "no *-database.sql.gz found in $BK"
@@ -654,6 +765,8 @@ NEWEST=$(docker exec "$CONTAINER" sh -c "ls -1t '$BK'/*-database.sql.gz 2>/dev/n
 PREFIX="${NEWEST%-database.sql.gz}"
 
 mkdir -p "$WORK.partial"
+prog begin backup "copy out of the container" "$STAMP" --total "$(docker exec "$CONTAINER" sh -c "du -cb '$PREFIX'-* | tail -n1 | cut -f1" 2>/dev/null || echo 0)"
+prog_watch "$WORK.partial" "$(docker exec "$CONTAINER" sh -c "du -cb '$PREFIX'-* | tail -n1 | cut -f1" 2>/dev/null || echo 0)"
 for f in $(docker exec "$CONTAINER" sh -c "ls -1 '$PREFIX'-*"); do
   docker cp "$CONTAINER:$f" "$WORK.partial/" >/dev/null 2>&1 || die "docker cp failed for $f"
 done
@@ -663,6 +776,8 @@ echo "$SRC_COUNTS" > "$WORK.partial/COUNTS.txt"
 echo "$SRC_SANITY" > "$WORK.partial/SANITY.txt"
 chmod -R go-rwx "$WORK.partial"
 
+prog_unwatch
+prog begin backup "verify the dump" "$STAMP"
 set_files "$WORK.partial" || die "backup set incomplete (need database, public files, private files, site_config)"
 gzip -t "$WORK.partial/$DBF" || die "database archive is corrupt"
 for t in "$PUBF" "$PRIVF"; do tar -tf "$WORK.partial/$t" >/dev/null || die "archive unreadable: $t"; done
@@ -672,12 +787,15 @@ mv "$WORK.partial" "$WORK"
 
 # encrypted archive (public-key encryption; this box cannot decrypt it)
 mkdir -p "$ARCH.partial"
+ETOT=$(bytes_of "$WORK/$DBF" "$WORK/$PUBF" "$WORK/$PRIVF" "$WORK/$CFGF")
+prog begin backup "encrypt (age)" "$STAMP" --total "$ETOT"; prog_watch "$ARCH.partial" "$ETOT"
 for f in "$DBF" "$PUBF" "$PRIVF" "$CFGF"; do
   "$AGE" -r "$ARCHIVE_RECIPIENT" -o "$ARCH.partial/$f.age" "$WORK/$f" || die "encryption failed for $f"
   head -c 22 "$ARCH.partial/$f.age" | grep -q '^age-encryption.org/v1' || die "encrypted file has no age header: $f"
 done
 cp "$WORK/VERSIONS.txt" "$WORK/ORIGIN.txt" "$WORK/COUNTS.txt" "$WORK/SANITY.txt" "$WORK/MANIFEST.sha256" "$ARCH.partial/"
 echo "${ARCHIVE_RECIPIENT}" > "$ARCH.partial/RECIPIENT.txt"
+prog_unwatch
 ( cd "$ARCH.partial" && sha256sum -- *.age *.txt MANIFEST.sha256 > SHA256SUMS )
 mv "$ARCH.partial" "$ARCH"
 
@@ -706,17 +824,18 @@ prune_keep "$BASE/own/weekly" "$KEEP_WEEKLY"
 prune_keep "$BASE/own/monthly" "${KEEP_MONTHLY:-12}"
 
 SIZE_MB=$(du -sm "$ARCH" | cut -f1)
+prog end OK "${SIZE_MB} MB encrypted"
 log "OK $STAMP ${SIZE_MB}MB encrypted (origin $ORIGIN)"
 status "OK backup $STAMP ${SIZE_MB}MB encrypted origin=$ORIGIN"
 state_put backup result=OK at="$(date -Is)" started="$(date -Is -d @"$START")" set="$STAMP" size_mb="$SIZE_MB" encrypted=yes \
-  recipient="${ARCHIVE_RECIPIENT:0:12}" origin="$ORIGIN" counts="$SRC_COUNTS" sanity="$SRC_SANITY" location="$(hostname):$ARCH" \
-  daily="$(find "$BASE/own/daily" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' | wc -l)" \
+  recipient="${ARCHIVE_RECIPIENT:0:12}" origin="$ORIGIN" counts="$SRC_COUNTS" sanity="$SRC_SANITY" location="$(hostname):$ARCH" bench_s="$BENCH_S" duration_s="$(( $(date +%s) - START ))" \
+  daily="$(find "$BASE/own/daily" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' ! -name '.*' | wc -l)" \
   weekly="$(find "$BASE/own/weekly" -mindepth 1 -maxdepth 1 -type d | wc -l)" monthly="$(find "$BASE/own/monthly" -mindepth 1 -maxdepth 1 -type d | wc -l)"
 report_quiet
 EOF_BACKUP
 
 # ---------------------------------------------------------------- push.sh
-cat > "$BASE/bin/push.sh" <<'EOF_PUSH'
+cat > "$NB/push.sh" <<'EOF_PUSH'
 #!/bin/bash
 # Push encrypted archives (+ standby set, + receipts, + this box's status) to the peer. Never deletes on the peer.
 # Usage: push.sh            # everything
@@ -742,7 +861,20 @@ fi
 wait_push_idle "push.sh $MODE"
 T0=$SECONDS; ATTEMPTS=0; BUSY_WAIT=0
 ERRF=$(mktemp); trap 'rm -f "$ERRF"' EXIT
-up() { local rc=0; rsync -aH --partial --timeout=600 --exclude '*.partial' "${RSYNC_E[@]}" "$@" 2>"$ERRF" || rc=$?; cat "$ERRF" >&2; return $rc; }
+STATSF="$STATE/push-stats.json"; rm -f "$STATSF"
+BW=(); [ "${PUSH_BWLIMIT_KBPS:-0}" -gt 0 ] && BW=(--bwlimit="$PUSH_BWLIMIT_KBPS")
+PSET=""; PSTEP=""
+# up ARGS... : one rsync. --info=progress2/--stats are client-side only (the peer's rrsync never sees them); the
+# output feeds progress.py, which keeps state/progress.json current and adds the byte counts to push-stats.json.
+up() {
+  local rc
+  prog begin push "$PSTEP" "$PSET" --total "${PTOTAL:-0}"
+  set +e
+  rsync -aH --partial --timeout=600 --exclude '*.partial' "${BW[@]}" --info=progress2 --stats "${RSYNC_E[@]}" "$@" 2>"$ERRF" \
+    | ERPB_STATE="$STATE" ERPB_ME="$ME" ERPB_REPORT="$(dirname "$0")/report.sh" python3 "$(dirname "$0")/progress.py" rsync "$STATSF"
+  rc=${PIPESTATUS[0]}; set -e
+  cat "$ERRF" >&2; return "$rc"
+}
 # try_up ARGS... : up to 3 real attempts. The peer's rrsync refusing because another push is still writing
 # there (e.g. one started by an older kit that holds no lock) is NOT a failed attempt: wait and try again.
 try_up() {
@@ -755,6 +887,8 @@ try_up() {
       [ $(( BUSY_WAIT % 300 )) -lt "$poll" ] && log "$PEER_NAME is still receiving another push (its rrsync lock), waiting... ($((BUSY_WAIT / 60)) of ${PUSH_WAIT_MIN:-300} min)"
       sleep "$poll"; BUSY_WAIT=$((BUSY_WAIT + poll)); continue
     fi
+    # the peer's rrsync refusing an option or a path is permanent: retrying cannot change it
+    if grep -q "rrsync error:" "$ERRF"; then log "$PEER_NAME's rrsync refused this transfer: $(grep -m1 'rrsync error:' "$ERRF" | cut -c1-200)"; return 1; fi
     [ "$t" -ge 3 ] && return 1
     log "attempt $t failed, retrying"; sleep "${PUSH_RETRY_SLEEP:-300}"; t=$((t + 1))
   done
@@ -766,30 +900,63 @@ share_status() { # this box's status rides along with the receipts, so the peer'
 mkdir -p "$BASE/own/receipts" "$BASE/own/monthly"
 if [ "$MODE" = receipts ]; then
   share_status
+  PSET=receipts; PSTEP="receipts"; PTOTAL=0
   try_up "$BASE/own/receipts" "$(peer_dest)" || die "receipt push to $PEER_NAME failed"
-  log "OK receipts pushed"; exit 0
+  prog end OK receipts; log "OK receipts pushed"; exit 0
 fi
 share_status
+N=$(basename "$(newest_dir "$BASE/own/daily")"); SB=$(newest_dir "$BASE/work/standby"); SBS=no; PSET="$N"
+NEWB=$(bytes_of "$BASE/own/daily/$N"); SBB=0; [ -n "$SB" ] && SBB=$(bytes_of "$SB")
+# tell the peer first what is coming (a few hundred bytes): its progress.sh / restore test read this
+inflight() { printf '{"schema":"erp-backup-inflight/1","box":"%s","state":"%s","set":"%s","archive_bytes":%s,"standby_set":"%s","standby_bytes":%s,"started_at":"%s","updated_at":"%s"}\n' \
+  "$ME" "$1" "$N" "$NEWB" "$(basename "${SB:-none}")" "$SBB" "$PSTART" "$(date -Is)" > "$BASE/own/receipts/inflight-$ME.json"; }
+PSTART=$(date -Is); inflight sending
+PSTEP="notice to $PEER_NAME (0/4)"; PTOTAL=0
+try_up "$BASE/own/receipts" "$(peer_dest)" || die "push to $PEER_NAME ($PEER_HOST) failed 3 times ($(link_desc))"
 SRC=("$BASE/own/daily" "$BASE/own/weekly" "$BASE/own/monthly" "$BASE/own/receipts")
+PSTEP="encrypted archives (1/4)"; PTOTAL="$NEWB"
 try_up --exclude SHA256SUMS "${SRC[@]}" "$(peer_dest)" || die "archive push to $PEER_NAME ($PEER_HOST) failed 3 times ($(link_desc))"
+PSTEP="archive completion markers (2/4)"; PTOTAL=0
 try_up "${SRC[@]}" "$(peer_dest)" || die "archive push to $PEER_NAME: the completion markers did not go (sets stay incomplete there)"
-SB=$(newest_dir "$BASE/work/standby"); SBS=no
 if [ -n "$SB" ]; then
-  try_up --exclude MANIFEST.sha256 "$SB" "$(peer_dest standby/)" || die "standby-set push to $PEER_NAME failed"
-  try_up "$SB" "$(peer_dest standby/)" || die "standby-set push to $PEER_NAME: MANIFEST did not go (set stays incomplete there)"
+  SN="$(basename "$SB")"; PSTEP="plaintext standby set $SN (3/4)"; PTOTAL="$SBB"
+  # DELTA_STANDBY=1: the peer keeps the set it last restored as standby/.basis; rsync matches today's files against
+  # it by similar name (-yy with --copy-dest) and sends only what changed - mostly the new photos, not the whole tar.
+  # PUSH_TRANSPORT=local has no jail to anchor "/" at, so it gives the basis as a real path.
+  # The peer's rrsync may refuse those options: then the set goes in full, as before.
+  # (--mkpath creates standby/ on a first push; rsync >= 3.2.3 on both ends, rrsync allows it)
+  DELTAOK=0
+  if [ "${DELTA_STANDBY:-1}" = 1 ]; then
+    # rrsync refuses ".." in --copy-dest; a leading "/" is anchored at the jail root (= RECV_DIR on the peer)
+    BASISARG=/standby/.basis; [ "${PUSH_TRANSPORT:-ssh}" = local ] && BASISARG="${PEER_LOCAL_DIR%/}/standby/.basis"
+    if try_up --exclude MANIFEST.sha256 --mkpath -yy --copy-dest="$BASISARG" "$SB/" "$(peer_dest "standby/$SN/")"; then DELTAOK=1
+    else log "the delta push of the standby set failed or its options were refused; sending it in full"; fi
+  fi
+  if [ "$DELTAOK" = 1 ]; then
+    PSTEP="standby manifest (4/4)"; PTOTAL=0
+    try_up --mkpath "$SB/" "$(peer_dest "standby/$SN/")" || die "standby-set push to $PEER_NAME: MANIFEST did not go (set stays incomplete there)"
+  else
+    try_up --exclude MANIFEST.sha256 "$SB" "$(peer_dest standby/)" || die "standby-set push to $PEER_NAME failed"
+    PSTEP="standby manifest (4/4)"; PTOTAL=0
+    try_up "$SB" "$(peer_dest standby/)" || die "standby-set push to $PEER_NAME: MANIFEST did not go (set stays incomplete there)"
+  fi
   rm -rf "$SB"; SBS=yes
 fi
-N=$(basename "$(newest_dir "$BASE/own/daily")")
+inflight "done"; PSTEP="finish"; PTOTAL=0; try_up "$BASE/own/receipts" "$(peer_dest)" || true
 DUR=$((SECONDS - T0))
-log "OK pushed through $N to $PEER_NAME in ${DUR}s, $ATTEMPTS rsync call(s) (standby set sent: $SBS)"
-status "OK push $N -> $PEER_NAME standby=$SBS ${DUR}s attempts=$ATTEMPTS"
+read -r SENT XFER <<<"$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("bytes_sent",0), d.get("transferred_file_bytes",0))' "$STATSF" 2>/dev/null || echo "0 0")"
+RATE=0; [ "$DUR" -gt 0 ] && RATE=$(( SENT / DUR / 1024 ))
+prog end OK "$((SENT / 1048576)) MB sent in ${DUR}s (${RATE} KB/s)"
+log "OK pushed through $N to $PEER_NAME in ${DUR}s: $((SENT / 1048576)) MB sent at ${RATE} KB/s ($((XFER / 1048576)) MB of file data; standby set as delta: ${DELTAOK:-0}), $ATTEMPTS rsync call(s) (standby set sent: $SBS)"
+status "OK push $N -> $PEER_NAME standby=$SBS ${DUR}s attempts=$ATTEMPTS sent=${SENT}B rate=${RATE}KB/s"
 state_put push result=OK at="$(date -Is)" set="$N" peer="$PEER_NAME" standby_set_sent="$SBS" duration_s="$DUR" attempts="$ATTEMPTS" transport="${PUSH_TRANSPORT:-ssh}" \
-  waited_for_other_push_s="${PUSH_WAITED:-0}" waited_for_peer_s="$BUSY_WAIT"
+  waited_for_other_push_s="${PUSH_WAITED:-0}" waited_for_peer_s="$BUSY_WAIT" bytes_sent="$SENT" file_bytes="$XFER" rate_kbps="$RATE" \
+  new_set_bytes="$NEWB" standby_bytes="$SBB" delta_standby="${DELTAOK:-0}"
 report_quiet
 EOF_PUSH
 
 # ---------------------------------------------------------------- recv-check.sh
-cat > "$BASE/bin/recv-check.sh" <<'EOF_CHECK'
+cat > "$NB/recv-check.sh" <<'EOF_CHECK'
 #!/bin/bash
 # Prune what the peer sent us, then prove the newest COMPLETE encrypted set is fresh and intact (dead-man switch).
 # A set without its SHA256SUMS marker is still in transit (or was cut off): it is reported, never trusted.
@@ -812,7 +979,7 @@ if [ -d "$R/standby" ]; then
   done
   KEEP=$(newest_complete "$R/standby" MANIFEST.sha256)
   # keep the newest complete plaintext set (what a failover refreshes from) and anything newer still arriving
-  for d in $(find "$R/standby" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' | sort); do
+  for d in $(find "$R/standby" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' ! -name '.*' | sort); do
     [ -n "$KEEP" ] && [[ "$(basename "$d")" < "$(basename "$KEEP")" ]] && rm -rf "$d"
   done
   if [ "$ALLOW_STANDBY" != 1 ]; then  # no standby here: drop plaintext sets unless they are our own data (failback)
@@ -839,7 +1006,7 @@ report_quiet
 EOF_CHECK
 
 # ---------------------------------------------------------------- standby-init.sh
-cat > "$BASE/bin/standby-init.sh" <<'EOF_SINIT'
+cat > "$NB/standby-init.sh" <<'EOF_SINIT'
 #!/bin/bash
 # ONE-TIME (interactive): create the read-only standby site for the peer's data and load the newest standby set.
 set -euo pipefail
@@ -881,7 +1048,7 @@ state_put standby result=OK at="$(date -Is)" site="$SS" set="$(basename "$SET")"
   check="$CHK_RESULT" counts_ok="$CHK_COUNTS_OK" files="$CHK_PUBN/$CHK_PUBA,$CHK_PRIVN/$CHK_PRIVA" files_missing="$CHK_MISSING" files_extra="$CHK_EXTRA" secrets="$CHK_SECRETS" decrypt_fail="$CHK_DECRYPT_FAIL" method=full-restore
 status "OK standby-init $SS set=$(basename "$SET") ${DUR}s check=$CHK_RESULT"
 write_receipt "$(basename "$SET")" "$SS" "$DUR" full-restore
-for d in $(find "$RECV_DIR/standby" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' | sort); do [[ "$(basename "$d")" > "$(basename "$SET")" ]] || rm -rf "$d"; done  # this set and older, by name
+keep_basis "$SET"
 if [ "$SEND_ENABLED" = 1 ]; then bash "$(dirname "$0")/push.sh" receipts || true; fi
 report_quiet
 if [ "$ALLOW_STANDBY" = 1 ]; then echo "Standby '$SS' ready (read-only). STANDBY_ENABLED=1. Now run: sudo bash $BASE/bin/install.sh"
@@ -889,7 +1056,7 @@ else echo "Failback copy loaded into '$SS' (read-only). Next: sudo bash $BASE/bi
 EOF_SINIT
 
 # ---------------------------------------------------------------- standby-refresh.sh
-cat > "$BASE/bin/standby-refresh.sh" <<'EOF_SREF'
+cat > "$NB/standby-refresh.sh" <<'EOF_SREF'
 #!/bin/bash
 # NIGHTLY: load the peer's newest standby set into the read-only standby site, verify, report.
 # Full "bench restore" into the standby site (Frappe's partial-restore refuses full backups).
@@ -900,9 +1067,13 @@ STAGE=standby
 . "$(dirname "$0")/lib-site.sh"
 need_root
 trap 'die "unexpected error at line $LINENO"' ERR
-# Usage: standby-refresh.sh [--now] [--force]   --now ignores the weekly schedule; --force also ignores the memory check
-NOW=0; FORCE=0
-for a in "$@"; do case "$a" in --now) NOW=1;; --force) NOW=1; FORCE=1;; *) die "unknown option $a";; esac; done
+# Usage: standby-refresh.sh [--now] [--force] [--wait-min=N]
+#   --now ignores the weekly schedule; --force also ignores the memory check;
+#   --wait-min=N waits at most N minutes for a set still arriving (default STANDBY_WAIT_MIN; 0 = do not wait).
+#   (An option, not an environment variable: the conf is sourced after the environment and would win.)
+NOW=0; FORCE=0; WAITMIN_ARG=""
+for a in "$@"; do case "$a" in --now) NOW=1;; --force) NOW=1; FORCE=1;; --wait-min=*) WAITMIN_ARG="${a#--wait-min=}";; *) die "unknown option $a";; esac; done
+[ -z "$WAITMIN_ARG" ] || [[ "$WAITMIN_ARG" =~ ^[0-9]+$ ]] || die "--wait-min needs a number of minutes"
 if [ "$STANDBY_ENABLED" != 1 ]; then log "STANDBY_ENABLED=0, skipping"; exit 0; fi
 if [ -f "$BASE/PROMOTED" ]; then log "box is PROMOTED; standby refresh disabled"; exit 0; fi
 if [ "$NOW" != 1 ] && ! standby_due; then log "standby refresh not due (STANDBY_EVERY=$STANDBY_EVERY, day $STANDBY_DAY; last $(state_get standby at))"; exit 0; fi
@@ -912,14 +1083,22 @@ site_exists "$SS" || die "standby site $SS missing; run standby-init.sh"
 # Pick the newest COMPLETE set (MANIFEST.sha256 present; push.sh sends it last). If a newer set is still
 # arriving, wait for it (up to STANDBY_WAIT_MIN) rather than restoring yesterday's or failing on a half copy.
 LAST="$(state_get standby set)"
-WAITED=0; WAIT_MAX=$(( ${STANDBY_WAIT_MIN:-150} * 60 ))
+WAITED=0; WAIT_MAX=$(( ${WAITMIN_ARG:-${STANDBY_WAIT_MIN:-240}} * 60 ))
 while :; do
   SET=$(newest_complete "$RECV_DIR/standby" MANIFEST.sha256)
   ARRIVING=""; for n in $(incomplete_sets "$RECV_DIR/standby" MANIFEST.sha256); do
     if [ -z "$SET" ] || [[ "$n" > "$(basename "$SET")" ]]; then [ "$(dir_age_min "$RECV_DIR/standby/$n")" -lt 2160 ] && ARRIVING="$ARRIVING $n"; fi
   done
+  # the peer announces a push before its first byte (receipts/inflight-<peer>.json): a set it is still sending
+  # counts as arriving even while the encrypted archives go first and its standby folder does not exist yet
+  ANN=$(python3 -c 'import json,sys,datetime as dt
+d=json.load(open(sys.argv[1])); t=dt.datetime.fromisoformat(d.get("updated_at") or d["started_at"])
+ok=d.get("state")=="sending" and (dt.datetime.now().astimezone()-t).total_seconds() < 8*3600
+print(d.get("standby_set","") if ok else "")' "$RECV_DIR/receipts/inflight-$PEER_NAME.json" 2>/dev/null || true)
+  if [ -n "$ANN" ] && [ "$ANN" != none ] && { [ -z "$SET" ] || [[ "$ANN" > "$(basename "$SET")" ]]; } && [[ " $ARRIVING " != *" $ANN "* ]]; then ARRIVING="$ARRIVING $ANN(announced)"; fi
   [ -n "$ARRIVING" ] && [ "$WAITED" -lt "$WAIT_MAX" ] || break
-  [ "$WAITED" = 0 ] && log "a newer standby set is still arriving:$ARRIVING; waiting up to ${STANDBY_WAIT_MIN:-150} min"
+  if [ $(( WAITED % 900 )) -lt "${STANDBY_WAIT_POLL_S:-300}" ]; then log "a newer standby set is still arriving:$ARRIVING; waiting (${WAITED}s of ${WAIT_MAX}s)"; fi
+  prog begin "restore test" "waiting for $PEER_NAME's push to finish" "${ARRIVING# }" --expect "$WAIT_MAX"
   sleep "${STANDBY_WAIT_POLL_S:-300}"; WAITED=$((WAITED + ${STANDBY_WAIT_POLL_S:-300}))
 done
 SKIPPED="$(incomplete_sets "$RECV_DIR/standby" MANIFEST.sha256 | tr '\n' ' ')"; SKIPPED="${SKIPPED% }"
@@ -942,10 +1121,12 @@ mem_snapshot; log "memory ok: $(mem_desc)"
 set_files "$SET" || die "standby set $SN incomplete"
 check_versions "$SET"
 get_dbpw
+prog begin "restore test" "copy set into the ERPNext container" "$SN" --total "$(bytes_of "$SET")"
 copy_set_in "$SET"
 readonly_on "$SS"
 set_enc_key
 wipe_standby_files
+prog begin "restore test" "bench restore into $SS" "$SN" --expect "$(state_get standby restore_s)"
 T0=$SECONDS
 RLOG="$STATE/standby-restore.log"
 if ! bx sh -c 'bench --site "$TS" restore "$TMPD/$DBF" --with-public-files "$TMPD/$PUBF" --with-private-files "$TMPD/$PRIVF" --db-root-password "$DBPW"' </dev/null > "$RLOG" 2>&1; then
@@ -955,18 +1136,20 @@ set_enc_key
 bx bench --site "$SS" clear-cache >/dev/null || true
 readonly_on "$SS"
 DUR=$((SECONDS - T0))
+prog begin "restore test" "checks (counts, sanity, files, secrets)" "$SN"
 save_source_conf
 cp "$SET/ORIGIN.txt" "$BASE/standby/ORIGIN" 2>/dev/null || echo "$PEER_NAME" > "$BASE/standby/ORIGIN"
 run_checks "$SS" "$SET"
 clean_tmp
-for d in $(find "$RECV_DIR/standby" -mindepth 1 -maxdepth 1 -type d ! -name '*.partial' | sort); do [[ "$(basename "$d")" > "$(basename "$SET")" ]] || rm -rf "$d"; done  # this set and older, by name
+keep_basis "$SET"
 R="$CHK_RESULT"
 rm -f "$STATE/standby_defer.env"
 state_put standby result=OK at="$(date -Is)" site="$SS" set="$SN" origin="$(cat "$BASE/standby/ORIGIN")" duration_s="$DUR" \
   every="$STANDBY_EVERY" mem_avail_mb_at_start="$MEM_AVAIL_MB" apps_stopped="${STOPPED_APPS# }" check="$R" counts_ok="$CHK_COUNTS_OK" counts="$CHK_COUNTS" src_counts="$CHK_SRC_COUNTS" files="$CHK_PUBN/$CHK_PUBA,$CHK_PRIVN/$CHK_PRIVA" files_missing="$CHK_MISSING" files_extra="$CHK_EXTRA" \
   secrets="$CHK_SECRETS" decrypt_fail="$CHK_DECRYPT_FAIL" sanity="$CHK_SANITY" src_sanity="$CHK_SRC_SANITY" sanity_ok="$CHK_SANITY_OK" \
-  skipped_incomplete="$SKIPPED" waited_s="$WAITED" method=full-restore readonly=yes job=OK
+  skipped_incomplete="$SKIPPED" waited_s="$WAITED" restore_s="$DUR" method=full-restore readonly=yes job=OK
 write_receipt "$SN" "$SS" "$DUR" full-restore
+prog end "$R" "restored in ${DUR}s"
 [ "$R" = Pass ] && status "OK standby $SN ${DUR}s check=Pass" || { status "WARN standby $SN ${DUR}s check=$R"; notify "standby check $R for $SN"; }
 log "standby $SS refreshed to $SN in ${DUR}s, check=$R"
 [ "$SEND_ENABLED" = 1 ] && bash "$(dirname "$0")/push.sh" receipts || true
@@ -974,7 +1157,7 @@ report_quiet
 EOF_SREF
 
 # ---------------------------------------------------------------- archive-test.sh
-cat > "$BASE/bin/archive-test.sh" <<'EOF_ATEST'
+cat > "$NB/archive-test.sh" <<'EOF_ATEST'
 #!/bin/bash
 # Prove the ENCRYPTED archive is (a) useless without Tim's key and (b) fully restorable with it.
 # Restores into throwaway site "restoretest" on THIS box, then drops it. Key is pasted, held in memory only.
@@ -1039,7 +1222,7 @@ if [ "${A:-Y}" != n ] && [ "${A:-Y}" != N ]; then drop_test_site restoretest; ec
 echo "Report: $REPORT"
 EOF_ATEST
 
-cat > "$BASE/bin/drop-restoretest.sh" <<'EOF_DROP'
+cat > "$NB/drop-restoretest.sh" <<'EOF_DROP'
 #!/bin/bash
 set -euo pipefail
 STAGE=drop
@@ -1051,7 +1234,7 @@ get_dbpw; drop_test_site restoretest; docker exec -u root "$CONTAINER" rm -rf /t
 EOF_DROP
 
 # ---------------------------------------------------------------- fence.sh
-cat > "$BASE/bin/fence.sh" <<'EOF_FENCE'
+cat > "$NB/fence.sh" <<'EOF_FENCE'
 #!/bin/bash
 # fence.sh on  : put THIS box's production site into read-only mode (reads OK, no writes/scheduler/email)
 # fence.sh off : back to normal
@@ -1070,7 +1253,7 @@ report_quiet
 EOF_FENCE
 
 # ---------------------------------------------------------------- promote-standby.sh
-cat > "$BASE/bin/promote-standby.sh" <<'EOF_PROMOTE'
+cat > "$NB/promote-standby.sh" <<'EOF_PROMOTE'
 #!/bin/bash
 # FAILOVER / FAILBACK: make the standby site this box's live "frontend".
 #   standby site  -> frontend            (now served at this box's ERPNext URL)
@@ -1141,7 +1324,7 @@ report_quiet
 EOF_PROMOTE
 
 # ---------------------------------------------------------------- demote.sh
-cat > "$BASE/bin/demote.sh" <<'EOF_DEMOTE'
+cat > "$NB/demote.sh" <<'EOF_DEMOTE'
 #!/bin/bash
 # After FAILBACK completed on the peer: give this box its own site back.
 #   frontend (peer's data)          -> standby site (read-only; nightly refresh resumes)
@@ -1171,7 +1354,7 @@ echo "Done. $SITE on $(hostname) is this box's own site again; $SS will be refre
 EOF_DEMOTE
 
 # ---------------------------------------------------------------- setup-send.sh
-cat > "$BASE/bin/setup-send.sh" <<'EOF_SSEND'
+cat > "$NB/setup-send.sh" <<'EOF_SSEND'
 #!/bin/bash
 # Make this box a SENDER: create its push key, pin the peer's host key, print the one line to copy.
 set -euo pipefail
@@ -1203,7 +1386,7 @@ echo
 EOF_SSEND
 
 # ---------------------------------------------------------------- setup-recv.sh
-cat > "$BASE/bin/setup-recv.sh" <<'EOF_SRECV'
+cat > "$NB/setup-recv.sh" <<'EOF_SRECV'
 #!/bin/bash
 # Make this box a RECEIVER for the peer: separate write-only folder + restricted key.
 # Optional: --from=IP[,IP]  (default: the peer's Tailscale IP)
@@ -1253,7 +1436,7 @@ ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
 EOF_SRECV
 
 # ---------------------------------------------------------------- link-test.sh
-cat > "$BASE/bin/link-test.sh" <<'EOF_LTEST'
+cat > "$NB/link-test.sh" <<'EOF_LTEST'
 #!/bin/bash
 # Sender-side check of the path to the peer: reachability, pinned host key, and that the key is jailed (write-only).
 set -euo pipefail
@@ -1269,11 +1452,22 @@ if grep -qiE 'rrsync|SSH_ORIGINAL_COMMAND|not.*rsync' <<<"$OUT"; then echo "PASS
 elif grep -qiE 'permission denied|not from a permitted host' <<<"$OUT"; then die "key REFUSED by $PEER_NAME (check setup-recv / from= on $PEER_NAME): $OUT"
 elif grep -qE '^(bin|etc|home|usr)$' <<<"$OUT"; then die "DANGER: got a shell listing on $PEER_NAME - key is not restricted"
 else die "unexpected answer from $PEER_NAME: $OUT"; fi
-status "OK link-test $PEER_NAME $(link_desc)"
+echo "--- path to $PEER_NAME (tailscale status / ping)"
+LP=$(link_probe); echo "$LP" | sed 's/^/  /'
+case "$(sed -n 's/^path=//p' <<<"$LP")" in
+  direct) echo "PASS path: direct ($(sed -n 's/^endpoint=//p' <<<"$LP"))" ;;
+  derp)   echo "WARN path: relayed through DERP $(sed -n 's/^derp=//p' <<<"$LP") - pushes run at relay speed (~1 Mbit/s); see the deploy notes for getting a direct path" ;;
+  *)      echo "WARN path: unknown (could not read tailscale status)" ;;
+esac
+[ "$(sed -n 's/^tun=//p' <<<"$LP")" = no ] && echo "NOTE tailscaled runs with userspace networking (netstack): fine for tens of Mbit/s, not the cause of a ~1 Mbit/s push"
+R=$(state_get push rate_kbps); [ -n "$R" ] && echo "last push: $(state_get push bytes_sent) bytes in $(state_get push duration_s) s = ${R} KB/s"
+# shellcheck disable=SC2046
+state_put link at="$(date -Is)" $(tr '\n' ' ' <<<"$LP") last_push_rate_kbps="$R"
+status "OK link-test $PEER_NAME $(link_desc) path=$(sed -n 's/^path=//p' <<<"$LP")"
 EOF_LTEST
 
 # ---------------------------------------------------------------- offsite.sh (optional second target)
-cat > "$BASE/bin/offsite.sh" <<'EOF_OFFSITE'
+cat > "$NB/offsite.sh" <<'EOF_OFFSITE'
 #!/bin/bash
 # A second copy of THIS box's ENCRYPTED archives (never plaintext) somewhere other than the peer:
 #   TARGET2_KIND=dir     TARGET2_PATH=<a mount point>   (an SMB/NFS share or USB disk mounted on this box;
@@ -1301,6 +1495,7 @@ exec 9>"$BASE/.offsite.lock"; flock -n 9 || die "another offsite copy is running
 T0=$SECONDS
 NEWEST=$(newest_complete "$BASE/own/daily" SHA256SUMS); [ -n "$NEWEST" ] || die "no complete own archive to copy yet"
 N=$(basename "$NEWEST"); D="${TARGET2_PATH%/}/$ME"
+prog begin offsite "copy to $TARGET2_KIND target" "$N" --expect "$(state_get offsite duration_s)"
 if [ "$TARGET2_KIND" = dir ]; then
   if [ "${TARGET2_REQUIRE_MOUNT:-1}" = 1 ]; then mountpoint -q "$TARGET2_PATH" || die "$TARGET2_PATH is not mounted (refusing to fill the local disk; mount it, or set TARGET2_REQUIRE_MOUNT=0)"; fi
   mkdir -p "$D"
@@ -1325,6 +1520,7 @@ else
   SIZE=$(rc size "$D" --json 2>/dev/null | python3 -c 'import json,sys; print("%dM" % (json.load(sys.stdin)["bytes"] // 1000000))' || echo "?")
 fi
 DUR=$((SECONDS - T0))
+prog end OK "$SIZE there"
 log "OK $N copied to $TARGET2_KIND target in ${DUR}s ($SIZE there)"
 status "OK offsite $N $TARGET2_KIND ${DUR}s $SIZE"
 state_put offsite result=OK at="$(date -Is)" set="$N" kind="$TARGET2_KIND" target="$TARGET2_PATH" duration_s="$DUR" size="$SIZE"
@@ -1332,7 +1528,7 @@ report_quiet
 EOF_OFFSITE
 
 # ---------------------------------------------------------------- scrub.sh (weekly bit-rot check of every stored set)
-cat > "$BASE/bin/scrub.sh" <<'EOF_SCRUB'
+cat > "$NB/scrub.sh" <<'EOF_SCRUB'
 #!/bin/bash
 # Re-verify the checksums of EVERY complete encrypted set this box holds (its own and the peer's), not just the
 # newest. A disk that silently corrupts an old weekly is found on the Sunday it happens, not on the day it is needed.
@@ -1342,6 +1538,7 @@ STAGE=scrub
 need_root
 exec 9>"$BASE/.scrub.lock"; flock -n 9 || die "another scrub is running"
 T0=$SECONDS; N=0; BAD=""; declare -A SEEN=()
+prog begin scrub "re-verify every stored set" "all" --expect "$(state_get scrub duration_s)"
 for root in "$BASE/own" "$RECV_DIR"; do
   for k in daily weekly monthly; do
     for d in "$root/$k"/*/; do
@@ -1354,13 +1551,14 @@ for root in "$BASE/own" "$RECV_DIR"; do
 done
 [ -z "$BAD" ] || die "checksum mismatch in:$BAD"
 DUR=$((SECONDS - T0))
+prog end OK "$N sets"
 log "OK $N sets verified in ${DUR}s"; status "OK scrub $N sets ${DUR}s"
 state_put scrub result=OK at="$(date -Is)" sets="$N" duration_s="$DUR"
 report_quiet
 EOF_SCRUB
 
 # ---------------------------------------------------------------- watchdog.sh (daily: timers, status, notify)
-cat > "$BASE/bin/watchdog.sh" <<'EOF_WATCH'
+cat > "$NB/watchdog.sh" <<'EOF_WATCH'
 #!/bin/bash
 # Daily self-check. Re-installs timers that went missing (e.g. after an OS update), makes sure ERPNext can see this
 # box's status, and sends ONE notification (NOTIFY_URL) when the overall state is not ok - again only when the set
@@ -1372,7 +1570,7 @@ STAGE=watchdog
 . "$(dirname "$0")/common.sh"
 need_root
 SDIR="${ERP_KIT_SYSTEMD_DIR:-/etc/systemd/system}"
-want="erp-scrub erp-watchdog"
+want="erp-scrub erp-watchdog erp-progress"
 [ "$SEND_ENABLED" = 1 ] && want="$want erp-backup"
 [ "$STANDBY_ENABLED" = 1 ] && want="$want erp-standby"
 [ "$RECV_ENABLED" = 1 ] && want="$want erp-recv-check"
@@ -1387,6 +1585,10 @@ fi
 INC=no
 [ "${STATUS_TO_CONTAINER:-1}" = 1 ] && docker exec "$CONTAINER" test -f "$BENCH/sites/erp_backup_status/$ME.json" 2>/dev/null && INC=yes
 state_put watchdog result=OK at="$(date -Is)" timers_missing="$MISS" timers_repaired="$REPAIRED" status_in_container="$INC"
+if [ "$SEND_ENABLED" = 1 ] && [ "${PUSH_TRANSPORT:-ssh}" = ssh ]; then   # how do pushes reach the peer? (read-only)
+  # shellcheck disable=SC2046
+  state_put link at="$(date -Is)" $(link_probe | tr '\n' ' ') last_push_rate_kbps="$(state_get push rate_kbps)"
+fi
 bash "$(dirname "$0")/report.sh" >/dev/null 2>&1 || true
 read -r OVERALL CODES MSG < <(python3 - "$BASE/status.json" <<'PY'
 import json, sys
@@ -1410,7 +1612,7 @@ log "overall=$OVERALL alerts=$CODES timers_missing=${MISS:-none}${REPAIRED:+ rep
 EOF_WATCH
 
 # ---------------------------------------------------------------- run-now.sh (one-shot, e.g. before an upgrade)
-cat > "$BASE/bin/run-now.sh" <<'EOF_RUNNOW'
+cat > "$NB/run-now.sh" <<'EOF_RUNNOW'
 #!/bin/bash
 # Back up NOW, push to the peer, copy to the second target (if any), and print where things stand.
 #   --push-only   skip the backup: just send what is waiting (e.g. after a push that failed or was refused)
@@ -1429,7 +1631,7 @@ if [ "$SEND_ENABLED" = 1 ]; then
   echo "== push to $PEER_NAME (waits for a push already in progress)"; PUSH_RETRY_SLEEP="${PUSH_RETRY_SLEEP:-60}" bash "$B/push.sh"
 fi
 [ "${TARGET2_KIND:-none}" != none ] && [ "$PUSHONLY" = 0 ] && { echo "== second target"; bash "$B/offsite.sh"; }
-[ "$RESTORE" = 1 ] && { echo "== restore test"; STANDBY_WAIT_MIN=0 bash "$B/standby-refresh.sh" --now; }
+[ "$RESTORE" = 1 ] && { echo "== restore test"; bash "$B/standby-refresh.sh" --now --wait-min=0; }
 bash "$B/report.sh" >/dev/null 2>&1 || true
 python3 - "$BASE/status.json" <<'PY'
 import json, sys
@@ -1447,7 +1649,7 @@ PY
 EOF_RUNNOW
 
 # ---------------------------------------------------------------- set-conf.sh
-cat > "$BASE/bin/set-conf.sh" <<'EOF_SETCONF'
+cat > "$NB/set-conf.sh" <<'EOF_SETCONF'
 #!/bin/bash
 # Change one setting:      sudo bash set-conf.sh KEY VALUE
 # Enter a secret setting:  sudo bash set-conf.sh NOTIFY_URL --prompt     (typed hidden; never in shell history)
@@ -1470,7 +1672,7 @@ case "$K" in *_TIME|*_AT|*_CALENDAR|*_ENABLED|TARGET2_KIND|STANDBY_EVERY) echo "
 EOF_SETCONF
 
 # ---------------------------------------------------------------- stage-upgrade.sh (on demand, standby box)
-cat > "$BASE/bin/stage-upgrade.sh" <<'EOF_STAGE'
+cat > "$NB/stage-upgrade.sh" <<'EOF_STAGE'
 #!/bin/bash
 # ON DEMAND, on the box that holds the standby: rehearse an ERPNext image upgrade on a COPY of the peer's data.
 #   1. dumps the read-only standby site (the peer's data as of the last nightly restore) with bench backup
@@ -1511,7 +1713,7 @@ cleanup() {
 }
 trap cleanup EXIT
 T0=$SECONDS
-echo "== 1. dump the standby ($STANDBY_SITE) on $PROD"
+echo "== 1. dump the standby ($STANDBY_SITE) on $PROD"; prog begin "staged upgrade" "dump the standby" "$IMG"
 export TS="$STANDBY_SITE"
 SRC_COUNTS=$(site_counts "$STANDBY_SITE"); SRC_SANITY=$(site_sanity "$STANDBY_SITE")
 BK="$BENCH/sites/$STANDBY_SITE/private/backups"
@@ -1522,7 +1724,7 @@ for f in $(docker exec "$PROD" sh -c "ls -1 '$PREFIX'-*"); do docker cp "$PROD:$
 docker exec -u frappe "$PROD" sh -c "rm -f '$PREFIX'-*" || true
 echo "$SRC_COUNTS" > "$W/set/COUNTS.txt"; echo "$SRC_SANITY" > "$W/set/SANITY.txt"
 set_files "$W/set" || die "standby dump incomplete"
-echo "== 2. throwaway ERPNext from $IMG"
+echo "== 2. throwaway ERPNext from $IMG"; prog begin "staged upgrade" "boot a throwaway ERPNext" "$IMG" --expect 300
 rnd() { head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24; }
 STAGE_DB_PW=$(rnd)
 ( umask 077; printf 'ERPSTAGE_DB_PW=%s\nERPSTAGE_ADMIN_PW=%s\nERPSTAGE_IMAGE=%s\nERPSTAGE_DB_IMAGE=%s\nERPSTAGE_PORT=%s\nERPSTAGE_CONTAINER=%s\n' \
@@ -1553,7 +1755,7 @@ UP=0; for _ in $(seq 1 "${STAGE_BOOT_POLLS:-120}"); do
 done
 [ "$UP" = 1 ] || die "throwaway ERPNext did not come up (see: docker logs $SC)"
 BOOT_S=$((SECONDS - T0))
-echo "== 3. restore + migrate"
+echo "== 3. restore + migrate"; prog begin "staged upgrade" "restore + bench migrate" "$IMG"
 CONTAINER="$SC"; DBPW="$STAGE_DB_PW"; TMPD=/tmp/erp-stage; export DBPW TMPD TS=frontend
 copy_set_in "$W/set"
 bx bench --site frontend set-config -p pause_scheduler 1 >/dev/null
@@ -1593,6 +1795,7 @@ CONTAINER="$PROD"
 state_put stage result=OK at="$(date -Is)" image="$IMG" check="$RES" versions="$VERS" boot_s="$BOOT_S" restore_s="$RESTORE_S" migrate_s="$MIGRATE_S" \
   migrate_exit="$MIG_RC" not_running="$NOTRUN" ping="$PING" counts_ok="$CHK_COUNTS_OK" sanity_ok="$CHK_SANITY_OK" files_missing="$CHK_MISSING" \
   decrypt_fail="$CHK_DECRYPT_FAIL" total_s="$TOTAL" report="$REPORT"
+prog end "$RES" "migrate ${MIGRATE_S}s exit $MIG_RC"
 status "OK stage $IMG check=$RES migrate=${MIGRATE_S}s exit=$MIG_RC"
 report_quiet
 echo "STAGE $RES: migrate ${MIGRATE_S}s (exit $MIG_RC), programs not running: ${NOTRUN:-none}, ping $PING, data check $CHK_RESULT"
@@ -1601,15 +1804,341 @@ trap - ERR
 [ "$RES" != Fail ] || exit 1
 EOF_STAGE
 
+# ---------------------------------------------------------------- progress.py (live progress, both roles)
+cat > "$NB/progress.py" <<'EOF_PROGPY'
+#!/usr/bin/env python3
+"""erp-backup live progress (kit 2026-10-19.3).
+
+Every long job (backup, push, restore test, offsite copy, scrub, staged upgrade) writes what it is doing to
+state/progress.json as it goes; when it ends the record moves to state/progress-last.json. The push also tells
+the peer up front what it is about to send (receipts/inflight-<box>.json), so the receiving box can show how far
+along each incoming set is from the bytes already on its disk. progress.sh shows all of it; report.sh embeds it in
+status.json so ERPNext's get_backup_status can show it live (refreshed at most once a minute while a job runs).
+Commands: begin, bytes, end, rsync (parses rsync --info=progress2 --stats on stdin), watchdir, incoming,
+snapshot, show [--watch N] [--json]. Stdlib only."""
+import datetime as dt, json, os, re, subprocess, sys, time
+
+E = os.environ
+STATE = E.get("ERPB_STATE", "."); ME = E.get("ERPB_ME", ""); PEER = E.get("ERPB_PEER", "")
+RECV = E.get("ERPB_RECV_DIR", ""); REPORT = E.get("ERPB_REPORT", ""); HOST = os.uname().nodename
+CUR = os.path.join(STATE, "progress.json"); LAST = os.path.join(STATE, "progress-last.json")
+FRESH_S = 180
+
+
+def now(): return dt.datetime.now().astimezone()
+def iso(t=None): return (t or now()).isoformat(timespec="seconds")
+def parse(ts):
+    try: return dt.datetime.fromisoformat(ts)
+    except Exception: return None
+def load(p):
+    try:
+        with open(p) as f: return json.load(f)
+    except Exception: return None
+def save(p, d):
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f: json.dump(d, f)
+    os.replace(tmp, p)
+def alive(pid):
+    try: os.kill(int(pid), 0); return True
+    except Exception: return False
+def human(n):
+    if n is None: return "?"
+    n = float(n)
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024 or u == "TB": return f"{n:.0f} {u}" if u == "B" else f"{n:.1f} {u}"
+        n /= 1024
+def hms(s):
+    if s is None: return "?"
+    s = int(max(0, s)); return f"{s // 3600}h{(s % 3600) // 60:02d}m" if s >= 3600 else f"{s // 60}m{s % 60:02d}s"
+def hhmm(ts):
+    t = parse(ts or ""); return t.strftime("%H:%M") if t else "?"
+def tree_bytes(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try: total += os.lstat(os.path.join(root, f)).st_size
+            except OSError: pass
+    return total
+
+
+def maybe_report():
+    """Refresh status.json (and its copy inside ERPNext) at most once a minute while a job runs."""
+    if not REPORT: return
+    stamp = os.path.join(STATE, ".progress-report")
+    try:
+        if time.time() - os.path.getmtime(stamp) < 60: return
+    except OSError: pass
+    open(stamp, "w").close()
+    subprocess.Popen(["bash", REPORT], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def compute(d):
+    """rate, % and ETA from what is known: bytes against a total, or elapsed time against the last run."""
+    t = now(); st = parse(d.get("step_started_at", "")) or t
+    el = (t - st).total_seconds(); d["elapsed_s"] = int(el)
+    done, total = d.get("bytes_done"), d.get("bytes_total")
+    if d.get("rate_bps") is None and done and el > 0: d["rate_bps"] = int(done / el)
+    if total and done is not None and total > 0:
+        d["pct"] = round(min(100.0, 100.0 * done / total), 1)
+        r = d.get("rate_bps") or 0
+        if d.get("eta_s") is None and r > 0: d["eta_s"] = int(max(0, total - done) / r)
+    elif d.get("expect_s"):
+        d["pct"] = round(min(99.0, 100.0 * el / d["expect_s"]), 1); d["eta_s"] = int(max(0, d["expect_s"] - el)); d["estimate"] = "from the last run's duration"
+    return d
+
+
+def cmd_begin(a):
+    phase, step, setname = a[0], a[1], a[2]
+    opts = dict(zip(a[3::2], a[4::2]))
+    prev = load(CUR) or {}
+    d = {"phase": phase, "step": step, "set": setname, "host": HOST, "box": ME, "pid": os.getppid(),
+         "job_started_at": prev.get("job_started_at") if prev.get("phase") == phase and prev.get("pid") == os.getppid() else iso(),
+         "step_started_at": iso(), "updated_at": iso(), "bytes_done": 0 if opts.get("--total") else None,
+         "bytes_total": int(opts["--total"]) if opts.get("--total", "").isdigit() and int(opts["--total"]) > 0 else None,
+         "total_from_job": opts.get("--total", "").isdigit() and int(opts["--total"]) > 0,
+         "expect_s": int(opts["--expect"]) if opts.get("--expect", "").isdigit() and int(opts["--expect"]) > 0 else None}
+    save(CUR, compute(d)); maybe_report()
+
+
+def cmd_bytes(a):
+    d = load(CUR)
+    if not d: return
+    d["bytes_done"] = int(a[0])
+    if len(a) > 1 and a[1].isdigit() and int(a[1]) > 0: d["bytes_total"] = int(a[1])
+    d.pop("rate_bps", None); d.pop("eta_s", None); d["updated_at"] = iso()
+    save(CUR, compute(d)); maybe_report()
+
+
+def cmd_end(a):
+    d = load(CUR) or {}
+    d.update({"result": a[0] if a else "OK", "note": " ".join(a[1:])[:300], "finished_at": iso()})
+    js = parse(d.get("job_started_at", ""))
+    if js: d["job_duration_s"] = int((now() - js).total_seconds())
+    save(LAST, d)
+    try: os.remove(CUR)
+    except OSError: pass
+
+
+PROG = re.compile(r"^\s*([\d,]+)\s+(\d+)%\s+([\d.]+)([kKMGT]?B)/s\s+(\d+):(\d{2}):(\d{2})")
+UNITS = {"B": 1, "kB": 1e3, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
+
+
+def cmd_rsync(a):
+    """stdin: rsync --info=progress2 --stats. Updates the current step; adds the call's byte counts to STATSFILE."""
+    statsfile = a[0]; last = 0.0; sent = None; xfer = None; buf = ""
+    stdin = sys.stdin.buffer
+    while True:
+        ch = stdin.read(1)
+        if not ch: break
+        c = ch.decode("latin-1")
+        if c not in "\r\n": buf += c; continue
+        line, buf = buf, ""
+        m = PROG.match(line)
+        if m:
+            done = int(m.group(1).replace(",", "")); pct = int(m.group(2))
+            rate = float(m.group(3)) * UNITS.get(m.group(4), 1); eta = int(m.group(5)) * 3600 + int(m.group(6)) * 60 + int(m.group(7))
+            if time.time() - last >= 2:
+                d = load(CUR)
+                if d:
+                    # rsync's own % is of everything it scanned (old sets included), so a total the job knows
+                    # (the new set's size) wins; rsync's figure is only used when there is none
+                    d.update({"bytes_done": done, "rate_bps": int(rate), "updated_at": iso(), "rsync_pct": pct})
+                    if not d.get("total_from_job"):
+                        d["eta_s"] = eta
+                        if pct > 0 and done > 0: d["bytes_total"] = int(done * 100 / pct)
+                    else:
+                        d.pop("eta_s", None)
+                    save(CUR, compute(d)); maybe_report()
+                last = time.time()
+            continue
+        s = line.replace(",", "")
+        m2 = re.match(r"Total bytes sent:\s*(\d+)", s)
+        if m2: sent = int(m2.group(1))
+        m3 = re.match(r"Total transferred file size:\s*(\d+)", s)
+        if m3: xfer = int(m3.group(1))
+    st = load(statsfile) or {"bytes_sent": 0, "transferred_file_bytes": 0, "calls": 0}
+    st["bytes_sent"] += sent or 0; st["transferred_file_bytes"] += xfer or 0; st["calls"] += 1
+    save(statsfile, st)
+
+
+def cmd_watchdir(a):
+    """Background sampler for a step with no byte counter of its own (encryption): bytes written so far in DIR."""
+    path, total, every = a[0], int(a[1]), int(a[2]) if len(a) > 2 else 5
+    owner = os.getppid()
+    while alive(owner):
+        d = load(CUR)
+        if not d: break
+        d["bytes_done"] = tree_bytes(path); d["bytes_total"] = total; d.pop("rate_bps", None); d.pop("eta_s", None); d["updated_at"] = iso()
+        save(CUR, compute(d)); maybe_report(); time.sleep(every)
+
+
+def incoming():
+    """Receiver side: sets from the peer still without their completion marker, sized on disk."""
+    if not RECV or not os.path.isdir(RECV): return {"from": PEER, "sets": [], "sender": None}
+    infl = load(os.path.join(RECV, "receipts", f"inflight-{PEER}.json"))
+    samples = load(os.path.join(STATE, "recv-sample.json")) or {}
+    out = []; tnow = time.time()
+    for kind, marker in (("daily", "SHA256SUMS"), ("standby", "MANIFEST.sha256")):
+        base = os.path.join(RECV, kind)
+        if not os.path.isdir(base): continue
+        for name in sorted(os.listdir(base)):
+            p = os.path.join(base, name)
+            if name.startswith(".") or name.endswith(".partial") or not os.path.isdir(p) or os.path.exists(os.path.join(p, marker)): continue
+            size = tree_bytes(p); age_min = int((tnow - os.path.getmtime(p)) / 60)
+            exp = None
+            if infl and infl.get("set") == name: exp = infl.get("archive_bytes" if kind == "daily" else "standby_bytes")
+            if infl and kind == "standby" and infl.get("standby_set") == name: exp = infl.get("standby_bytes")
+            key = f"{kind}/{name}"; rate = None
+            prev = samples.get(key)
+            if prev and tnow - prev[0] >= 5 and size >= prev[1]: rate = int((size - prev[1]) / (tnow - prev[0]))
+            if not prev or tnow - prev[0] >= 30: samples[key] = [tnow, size]
+            e = {"kind": kind, "set": name, "bytes_on_disk": size, "bytes_expected": exp, "rate_bps": rate, "age_min": age_min,
+                 "stalled": age_min >= 360 and not rate}
+            if exp: e["pct"] = round(min(100.0, 100.0 * size / exp), 1)
+            if exp and rate: e["eta_s"] = int(max(0, exp - size) / rate)
+            out.append(e)
+    try: save(os.path.join(STATE, "recv-sample.json"), {k: v for k, v in samples.items() if tnow - v[0] < 86400})
+    except OSError: pass
+    return {"from": PEER, "sets": out, "sender": infl}
+
+
+def snapshot():
+    cur = load(CUR)
+    if cur:
+        up = parse(cur.get("updated_at", ""))
+        cur["stale"] = (not alive(cur.get("pid", 0))) or (up is not None and (now() - up).total_seconds() > FRESH_S and not alive(cur.get("pid", 0)))
+        if cur["stale"]: cur = None
+        else: cur = compute(cur)
+    return {"schema": "erp-backup-progress/1", "at": iso(), "box": ME, "current": cur, "last": load(LAST), "incoming": incoming()}
+
+
+def line_for(d):
+    bits = []
+    if d.get("bytes_done") is not None:
+        bits.append(f"{human(d['bytes_done'])}" + (f" of ~{human(d['bytes_total'])}" if d.get("bytes_total") else ""))
+    if d.get("pct") is not None: bits.append(f"{d['pct']:.0f}%")
+    if d.get("rate_bps"): bits.append(f"{human(d['rate_bps'])}/s")
+    if d.get("eta_s") is not None: bits.append(f"ETA {hms(d['eta_s'])}" + (" (est.)" if d.get("estimate") else ""))
+    return "  ".join(bits)
+
+
+def show(as_json):
+    s = snapshot()
+    if as_json: print(json.dumps(s, indent=1)); return
+    print(f"erp-backup progress on {HOST} ({ME}) at {now().strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    c = s["current"]
+    if c:
+        print(f"NOW   {c['phase']}: {c['step']}   set {c.get('set')}")
+        print(f"      {line_for(c) or 'working'}   (step since {hhmm(c.get('step_started_at'))}, job since {hhmm(c.get('job_started_at'))}, {hms(c.get('elapsed_s'))} into this step)")
+    else:
+        print("NOW   idle")
+    l = s["last"]
+    if l: print(f"LAST  {l.get('phase')} {l.get('result')}  set {l.get('set')}  finished {hhmm(l.get('finished_at'))}" + (f" after {hms(l.get('job_duration_s'))}" if l.get("job_duration_s") else "") + (f"  ({l.get('note')})" if l.get("note") else ""))
+    inc = s["incoming"]
+    if RECV:
+        snd = inc.get("sender") or {}
+        if snd.get("state") == "sending": print(f"PEER  {PEER} is sending set {snd.get('set')} (started {hhmm(snd.get('started_at'))}; ~{human((snd.get('archive_bytes') or 0) + (snd.get('standby_bytes') or 0))} in all)")
+        for e in inc["sets"]:
+            print(f"IN    from {PEER}: {e['kind']} {e['set']}  {human(e['bytes_on_disk'])}" + (f" of {human(e['bytes_expected'])}  {e['pct']:.0f}%" if e.get("bytes_expected") else " so far")
+                  + (f"  {human(e['rate_bps'])}/s" if e.get("rate_bps") else "") + (f"  ETA {hms(e['eta_s'])}" if e.get("eta_s") is not None else "")
+                  + ("  STALLED (no growth, >6 h old)" if e.get("stalled") else ""))
+        if not inc["sets"] and snd.get("state") != "sending": print(f"IN    nothing arriving from {PEER}")
+    try:
+        t = subprocess.run(["systemctl", "list-timers", "erp-*", "--no-pager", "--no-legend"], capture_output=True, text=True, timeout=5).stdout.strip().splitlines()
+        nxt = [f"{x.split()[-2].replace('.timer', '')} {x.split()[1]} {x.split()[2][:5]}" for x in t if x.split() and x.split()[0] not in ("-", "n/a")][:6]
+        if nxt: print("NEXT  " + ", ".join(nxt))
+    except Exception: pass
+
+
+def main():
+    a = sys.argv[1:]
+    if not a: print(__doc__); return
+    c, rest = a[0], a[1:]
+    if c == "begin": cmd_begin(rest)
+    elif c == "bytes": cmd_bytes(rest)
+    elif c == "end": cmd_end(rest)
+    elif c == "rsync": cmd_rsync(rest)
+    elif c == "watchdir": cmd_watchdir(rest)
+    elif c == "snapshot": print(json.dumps(snapshot()))
+    elif c == "incoming": print(json.dumps(incoming()))
+    elif c == "show":
+        as_json = "--json" in rest; every = None
+        if "--watch" in rest:
+            i = rest.index("--watch"); every = int(rest[i + 1]) if len(rest) > i + 1 and rest[i + 1].isdigit() else 10
+        if every:
+            try:
+                while True:
+                    print("\033[2J\033[H", end=""); show(as_json); print(f"\n(refreshing every {every}s; Ctrl-C to stop)"); sys.stdout.flush(); time.sleep(every)
+            except KeyboardInterrupt: print()
+        else: show(as_json)
+
+
+if __name__ == "__main__":
+    main()
+EOF_PROGPY
+
+# ---------------------------------------------------------------- progress.sh
+cat > "$NB/progress.sh" <<'EOF_PROGSH'
+#!/bin/bash
+# Where is the backup right now?  sudo bash progress.sh [--watch [SECONDS]] [--json]
+# Shows this box's running job (bench backup / encrypt / push / restore test / ...) with set, bytes, %, rate and
+# ETA, the last finished job, and - on a receiving box - every set still arriving from the peer, sized on disk.
+STAGE=progress
+. "$(dirname "$0")/common.sh"
+need_root
+ERPB_STATE="$STATE" ERPB_ME="$ME" ERPB_PEER="$PEER_NAME" ERPB_RECV_DIR="$([ "$RECV_ENABLED" = 1 ] && echo "$RECV_DIR")" \
+  python3 "$(dirname "$0")/progress.py" show "$@"
+EOF_PROGSH
+
+# ---------------------------------------------------------------- tick.sh (every 2 min: live status, resume pushes)
+cat > "$NB/tick.sh" <<'EOF_TICK'
+#!/bin/bash
+# Every 2 minutes (erp-progress.timer). Cheap when idle: exits unless something is running or arriving.
+#  * while a job runs here or a set is arriving from the peer: refresh status.json, so ERPNext shows live progress
+#  * a push that FAILED (or a complete own set that was never pushed) is resumed after PUSH_RESUME_AFTER_MIN,
+#    at most PUSH_RESUME_MAX_PER_DAY times a day, through erp-push.service - never alongside another push
+set -euo pipefail
+STAGE=tick
+. "$(dirname "$0")/common.sh"
+need_root
+ACTIVE=0
+[ -f "$STATE/progress.json" ] && ACTIVE=1
+if [ "$RECV_ENABLED" = 1 ] && [ -n "$(ERPB_STATE="$STATE" ERPB_PEER="$PEER_NAME" ERPB_RECV_DIR="$RECV_DIR" python3 "$(dirname "$0")/progress.py" incoming 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print("x" if d["sets"] or (d.get("sender") or {}).get("state")=="sending" else "")' 2>/dev/null)" ]; then ACTIVE=1; fi
+[ "$ACTIVE" = 1 ] && report_quiet
+[ "$SEND_ENABLED" = 1 ] || exit 0
+NEWEST=$(newest_complete "$BASE/own/daily" SHA256SUMS); [ -n "$NEWEST" ] || exit 0
+N=$(basename "$NEWEST"); PR=$(state_get push result); PS=$(state_get push set); PAT=$(state_get push at)
+NEED=""
+[ "$PR" = FAIL ] && NEED="the last push failed ($(state_get push msg | cut -c1-120))"
+[ -z "$NEED" ] && [ "$N" != "$PS" ] && NEED="set $N was never pushed"
+[ -n "$NEED" ] || exit 0
+REF=$(stat -c %Y "$NEWEST/SHA256SUMS"); [ -n "$PAT" ] && REF=$(( $(date -d "$PAT" +%s) > REF ? $(date -d "$PAT" +%s) : REF ))
+[ $(( ( $(date +%s) - REF ) / 60 )) -ge "${PUSH_RESUME_AFTER_MIN:-60}" ] || exit 0
+[ -z "$(other_push_pids | tr -d ' \n')" ] || exit 0
+exec 8>"$PUSH_LOCK"; flock -n 8 || exit 0; exec 8>&-
+exec 9>"$BASE/.lock"; flock -n 9 || exit 0; exec 9>&-     # a backup is running: its own push follows
+TODAY=$(date +%F); CNT=0; [ "$(state_get resume day)" = "$TODAY" ] && CNT=$(state_get resume count)
+[ "${CNT:-0}" -lt "${PUSH_RESUME_MAX_PER_DAY:-6}" ] || exit 0
+state_put resume day="$TODAY" count="$(( ${CNT:-0} + 1 ))" at="$(date -Is)" why="$NEED"
+log "resuming the push to $PEER_NAME: $NEED"; status "OK tick resume push ($NEED)"
+if [ -f "${ERP_KIT_SYSTEMD_DIR:-/etc/systemd/system}/erp-push.service" ] && command -v systemctl >/dev/null; then
+  systemctl start --no-block erp-push.service
+else
+  setsid bash "$(dirname "$0")/push.sh" >/dev/null 2>&1 < /dev/null &
+fi
+EOF_TICK
+
 # ---------------------------------------------------------------- report.sh (status JSON for ERPNext / MCP)
-cat > "$BASE/bin/report.sh" <<'EOF_REPORT'
+cat > "$NB/report.sh" <<'EOF_REPORT'
 #!/bin/bash
 # Build status.json from state files (schema erp-backup-status/1) and drop a copy where ERPNext can read it:
 #   container: $BENCH/sites/erp_backup_status/<ME>.json
 STAGE=report
 . "$(dirname "$0")/common.sh"
 command -v python3 >/dev/null || exit 0
-ERPB_STATE="$STATE" ERPB_ME="$ME" ERPB_PEER="$PEER_NAME" ERPB_HOST="$(hostname)" ERPB_KIT="$(cat "$BASE/KIT_VERSION" 2>/dev/null)" \
+ERPB_STATE="$STATE" ERPB_ME="$ME" ERPB_PEER="$PEER_NAME" ERPB_RECV_DIR="$([ "$RECV_ENABLED" = 1 ] && echo "$RECV_DIR")" \
+  python3 "$(dirname "$0")/progress.py" snapshot > "$STATE/progress-snapshot.json.tmp" 2>/dev/null && mv "$STATE/progress-snapshot.json.tmp" "$STATE/progress-snapshot.json" || true
+ERPB_LINKMIN="${LINK_MIN_RATE_KBPS:-1000}" ERPB_STATE="$STATE" ERPB_ME="$ME" ERPB_PEER="$PEER_NAME" ERPB_HOST="$(hostname)" ERPB_KIT="$(cat "$BASE/KIT_VERSION" 2>/dev/null)" \
 ERPB_MAXAGE="$MAX_AGE_HOURS" ERPB_RECEIPT="$RECV_DIR/receipts/standby-of-$ME.json" ERPB_PROMOTED="$BASE/PROMOTED" ERPB_FENCED="$BASE/FENCED" \
 ERPB_T2="${TARGET2_KIND:-none}" ERPB_KD="$KEEP_DAILY" ERPB_KW="$KEEP_WEEKLY" ERPB_KM="${KEEP_MONTHLY:-12}" \
 ERPB_EVERY="$STANDBY_EVERY" ERPB_RRMAX="$REMOTE_RESTORE_MAX_HOURS" ERPB_EXPECT="$EXPECT_REMOTE_RESTORE" ERPB_ATMAX="$ARCHIVE_TEST_MAX_DAYS" ERPB_SEND="$SEND_ENABLED" ERPB_RECV="$RECV_ENABLED" ERPB_STANDBY="$STANDBY_ENABLED" ERPB_SITE="$SITE" ERPB_SS="$STANDBY_SITE" \
@@ -1632,7 +2161,9 @@ def old(d, limit):
     a = (d or {}).get("last_ok_age_hours", (d or {}).get("age_hours"))
     return a is None or a > limit
 st = {s: load(s) for s in ("backup", "push", "check", "standby", "archive_test", "install", "standby_defer",
-                          "offsite", "scrub", "watchdog", "stage")}
+                          "offsite", "scrub", "watchdog", "stage", "link", "resume")}
+try: progress = json.load(open(os.path.join(E["ERPB_STATE"], "progress-snapshot.json")))
+except Exception: progress = None
 for s, d in st.items():
     if d.get("at"): d["age_hours"] = age_h(d["at"])
     good = d.get("at") if d.get("result") == "OK" else d.get("last_ok_at")
@@ -1687,6 +2218,14 @@ if E["ERPB_STANDBY"] == "1" and (st["standby"].get("skipped_incomplete") or "").
     A("warning", "STANDBY_SET_INCOMPLETE", f"incomplete standby set(s) from the peer skipped: {st['standby'].get('skipped_incomplete')}")
 if E["ERPB_RECV"] == "1" and (st["check"].get("incomplete_newer") or "").strip():
     A("warning", "PEER_SET_INCOMPLETE", f"peer set(s) newer than the newest complete one never finished: {st['check'].get('incomplete_newer')}")
+lk = st["link"]
+if E["ERPB_SEND"] == "1" and lk.get("path") == "derp":
+    A("warning", "LINK_RELAYED", f"pushes to the peer go through Tailscale's DERP relay ({lk.get('derp')}), not a direct path - expect about 1 Mbit/s; last push {st['push'].get('rate_kbps', '?')} KB/s")
+elif E["ERPB_SEND"] == "1" and st["push"].get("rate_kbps", "").isdigit() and int(st["push"]["rate_kbps"]) < int(E.get("ERPB_LINKMIN") or 1000) and int(st["push"].get("bytes_sent") or 0) > 50 * 1048576:
+    A("warning", "LINK_SLOW", f"last push ran at {st['push']['rate_kbps']} KB/s ({lk.get('path') or 'path unknown'}{', userspace networking' if lk.get('tun') == 'no' else ''})")
+if (progress or {}).get("incoming", {}).get("sets"):
+    for e in progress["incoming"]["sets"]:
+        if e.get("stalled"): A("warning", "INCOMING_STALLED", f"{e['kind']} set {e['set']} from the peer has not grown for 6 h ({e['bytes_on_disk']} bytes on disk)")
 if promoted: A("critical", "PROMOTED", f"this box is serving {promoted.get('ORIGIN')}'s data since {promoted.get('AT')}")
 if os.path.exists(E["ERPB_FENCED"]): A("warning", "FENCED", "production site is in read-only mode")
 out = {
@@ -1700,6 +2239,7 @@ out = {
   "retention": {"daily": int(E.get("ERPB_KD") or 14), "weekly": int(E.get("ERPB_KW") or 8), "monthly": int(E.get("ERPB_KM") or 12)},
   "offsite": st["offsite"] if E.get("ERPB_T2", "none") != "none" else None, "target2_kind": E.get("ERPB_T2", "none"),
   "scrub": st["scrub"], "watchdog": st["watchdog"], "last_stage_upgrade": st["stage"] or None,
+  "progress": progress, "link": st["link"] or None, "push_resume": st["resume"] or None,
   "own_backup": b, "push": st["push"], "remote_restore_of_my_data": receipt,
   "peer_copies_check": st["check"], "standby_of_peer": st["standby"], "standby_deferred": st["standby_defer"] or None, "last_archive_test": st["archive_test"],
   "promoted": promoted, "fenced": os.path.exists(E["ERPB_FENCED"]),
@@ -1724,7 +2264,7 @@ fi
 EOF_REPORT
 
 # ---------------------------------------------------------------- install.sh
-cat > "$BASE/bin/install.sh" <<'EOF_INSTALL'
+cat > "$NB/install.sh" <<'EOF_INSTALL'
 #!/bin/bash
 # (Re)install systemd timers from erp-backup.conf. Run after setup changes and after every umbrelOS update.
 set -euo pipefail
@@ -1749,14 +2289,17 @@ unit erp-recv-check    "Verify ERPNext backups received from $PEER_NAME"      "$
 unit erp-offsite       "Copy ERPNext ($ME) encrypted archives to the second target" "${TARGET2_TIME:-04:30}" offsite.sh
 unit erp-scrub         "Re-verify every stored ERPNext backup set"           "${SCRUB_CALENDAR:-Sun *-*-* 08:30:00}" scrub.sh
 unit erp-watchdog      "erp-backup self-check and notification"              "${WATCHDOG_TIME:-07:45}" watchdog.sh
+unit erp-progress      "erp-backup live progress + resume of a failed push"   "*:0/2" tick.sh
+unit erp-push          "ERPNext ($ME) push to $PEER_NAME (on demand; started by tick.sh to resume a failed push)" "*-*-* 00:00" push.sh
 T2ON=0; [ "${TARGET2_KIND:-none}" != none ] && T2ON=1; ALWAYS=1
 if [ "$SEND_ENABLED" = 1 ];    then on erp-backup;     else off erp-backup; fi
 if [ "$STANDBY_ENABLED" = 1 ]; then on erp-standby;    else off erp-standby; fi
 if [ "$RECV_ENABLED" = 1 ];    then on erp-recv-check; else off erp-recv-check; fi
 if [ "$T2ON" = 1 ];            then on erp-offsite;    else off erp-offsite; fi
-on erp-scrub; on erp-watchdog
+on erp-scrub; on erp-watchdog; on erp-progress
+install -m 644 "$BASE/systemd/erp-push.service" "$SD/erp-push.service"; rm -f "$SD/erp-push.timer"   # service only, no timer
 systemctl daemon-reload
-for t in erp-backup:SEND_ENABLED erp-standby:STANDBY_ENABLED erp-recv-check:RECV_ENABLED erp-offsite:T2ON erp-scrub:ALWAYS erp-watchdog:ALWAYS; do
+for t in erp-backup:SEND_ENABLED erp-standby:STANDBY_ENABLED erp-recv-check:RECV_ENABLED erp-offsite:T2ON erp-scrub:ALWAYS erp-watchdog:ALWAYS erp-progress:ALWAYS; do
   n=${t%%:*}; v=${t##*:}; [ "${!v}" = 1 ] && systemctl enable --now "$n.timer" >/dev/null
 done
 state_put install result=OK at="$(date -Is)" send="$SEND_ENABLED" recv="$RECV_ENABLED" standby="$STANDBY_ENABLED" target2="${TARGET2_KIND:-none}" kit="$(cat "$BASE/KIT_VERSION" 2>/dev/null)"
@@ -1766,7 +2309,7 @@ systemctl list-timers 'erp-*' --all --no-pager
 EOF_INSTALL
 
 # ---------------------------------------------------------------- status.sh
-cat > "$BASE/bin/status.sh" <<'EOF_STATUS'
+cat > "$NB/status.sh" <<'EOF_STATUS'
 #!/bin/bash
 # Read-only report. Paste the whole output back to Claude. Contains no secrets.
 STAGE=status
@@ -1786,7 +2329,9 @@ docker exec "$CONTAINER" sh -c "ls -1 '$BENCH/sites' | grep -v -e '\.json$' -e '
 echo "--- timers"
 systemctl list-timers 'erp-*' --all --no-pager 2>/dev/null || true
 PP=$(other_push_pids | tr '\n' ' '); [ -n "${PP// /}" ] && echo "PUSH IN PROGRESS to $PEER_NAME: $(push_progress $PP)" || echo "no push in progress"
-for u in erp-backup erp-standby erp-recv-check erp-offsite erp-scrub erp-watchdog; do echo "$u.service: $(systemctl show -p Result --value "$u.service" 2>/dev/null || echo n/a)"; done
+echo "--- progress (progress.sh --watch for live)"; bash "$(dirname "$0")/progress.sh" 2>/dev/null | sed 's/^/  /'
+[ -f "$STATE/link.env" ] && echo "--- path to $PEER_NAME: $(tr '\n' ' ' < "$STATE/link.env")"
+for u in erp-backup erp-push erp-standby erp-recv-check erp-offsite erp-scrub erp-watchdog erp-progress; do echo "$u.service: $(systemctl show -p Result --value "$u.service" 2>/dev/null || echo n/a)"; done
 echo "--- last 15 status lines"
 tail -n 15 "$STATUS" 2>/dev/null || echo "(no status.log yet)"
 echo "--- own encrypted archives"
@@ -1815,10 +2360,20 @@ cat "$BASE/status.json" 2>/dev/null || echo "(not generated)"
 echo "===== end"
 EOF_STATUS
 
-chmod 700 "$BASE"/bin/*.sh
-chmod 600 "$BASE/bin/common.sh" "$BASE/bin/lib-site.sh"
+chmod 700 "$NB"/*.sh "$NB"/*.py
+chmod 600 "$NB/common.sh" "$NB/lib-site.sh"
+# atomic: rename(2) each new file over the old one; a running script keeps its open (old) file
+for f in "$NB"/*; do mv -f "$f" "$BASE/bin/$(basename "$f")"; done
+rmdir "$NB" 2>/dev/null || true
+echo "$KIT_VERSION" > "$BASE/KIT_VERSION.tmp" && mv -f "$BASE/KIT_VERSION.tmp" "$BASE/KIT_VERSION"
+trap - EXIT
+if [ -f "$BASE/state/install.env" ]; then
+  bash "$BASE/bin/install.sh" >/dev/null 2>&1 && echo "Timers re-armed from erp-backup.conf." || echo "WARN: install.sh failed - run: sudo bash $BASE/bin/install.sh"
+else
+  for t in $TIMERS_WERE; do systemctl start "$t.timer" >/dev/null 2>&1 || true; done
+fi
 
 echo
 echo "erp-backup kit $KIT_VERSION installed for role '$ME' in $BASE"
 echo "Scripts: $(cd "$BASE/bin" && ls | tr '\n' ' ')"
-echo "Next step: sudo bash $BASE/bin/install.sh   (re-arms the timers; then status.sh)"
+[ -f "$BASE/state/install.env" ] && echo "Next step: sudo bash $BASE/bin/status.sh" || echo "Next step (first install): the setup steps, then sudo bash $BASE/bin/install.sh"

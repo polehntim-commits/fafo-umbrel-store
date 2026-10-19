@@ -22,6 +22,7 @@ anywhere:
 | `erp-recv-check` | 07:30 | 07:00 | Prunes what the peer sent and proves the newest complete set is fresh and intact. This is the dead-man switch. |
 | `erp-offsite` | 04:30 | 04:30 | Optional. Copies **encrypted** archives to a second target: a mounted share or disk, or any rclone remote such as SMB, S3 or B2. |
 | `erp-scrub` | Sun 08:30 | Sun 08:30 | Re-verifies the checksums of **every** stored set, own and peer. |
+| `erp-progress` | every 2 min | every 2 min | While a job runs or a set is arriving: refreshes `status.json` so ERPNext shows live progress. Resumes a **failed** push after 60 min (`PUSH_RESUME_AFTER_MIN`; at most 6 times a day; never alongside another push) through the on-demand `erp-push.service`. |
 | `erp-watchdog` | 07:45 | 07:15 | Re-installs timers that went missing, and checks ERPNext can see the status. Sends **one** notification when something is wrong (and once when it recovers). |
 
 ## How a restore is verified
@@ -47,6 +48,39 @@ Backup Record.
 `archive-test.sh` is the other half. It proves the **encrypted** archive is useless without the key and
 restorable with it. It needs the private key pasted in by a person, so it stays manual and is
 reminded by `ARCHIVE_TEST_DUE`.
+
+## What goes over the wire, and how fast
+
+- **Encrypted sets** go whole every night: about the size of the backup. They have new names each night, and
+  age uses a fresh random key per file, so identical data never encrypts to the same bytes. No rsync option
+  (`--partial`, `--inplace`, `--no-whole-file`) can turn that into a delta.
+- **The plaintext standby set** goes as a delta (`DELTA_STANDBY=1`, the default):
+  - The receiver keeps the set it last restored as `standby/.basis`, costing one extra set of disk.
+  - The sender runs `rsync -yy --copy-dest=/standby/.basis --mkpath`. rrsync anchors the leading `/` at the
+    jail and refuses `..`.
+  - Files are matched by similar name, and only changed blocks travel: mostly new photos, plus the
+    gzip'd database dump.
+  - If the peer refuses those options, the push falls back to a full send by itself.
+- Each push records `bytes_sent`, `duration_s` and `rate_kbps`, in its state and in the status file that
+  goes to the peer.
+- `link-test.sh` and the daily watchdog read the path from the Tailscale container (`tailscale status --json`,
+  `tailscale ping`):
+  - **direct**, with its endpoint, or **DERP**, with the relay region;
+  - whether tailscaled runs with userspace networking.
+- `LINK_RELAYED` means the push runs through a DERP relay, which typically gives about 1 Mbit/s.
+  `LINK_SLOW` means the last push of more than 50 MB ran under `LINK_MIN_RATE_KBPS`. Userspace networking
+  costs CPU, but it is rarely what limits a push below a few Mbit/s.
+
+## Installing over a running kit
+
+From 2026-10-19.3 the installer:
+
+- writes every script to a staging directory and renames it into `bin/`, so a running script keeps its file;
+- waits while any `erp-*` job runs (`--no-wait` refuses instead; `--force` installs anyway);
+- pauses the timers while it writes, and re-arms them afterwards.
+
+Earlier kits overwrote scripts in place. bash reads a script as it runs, so a push running during an
+install died mid-line ("syntax error near unexpected token") on 2026-10-19.
 
 ## Sets are complete only when their marker arrives
 
@@ -86,6 +120,37 @@ A push can take hours over the tailnet; the nightly one is often still running i
 - it keeps the outgoing standby set until a push of it succeeds.
 
 `run-now.sh --push-only` is the same, plus the summary.
+
+## Watching a backup as it runs
+
+`sudo bash bin/progress.sh --watch` (default refresh 10 s; `--json` for machines). It shows:
+
+- **NOW**: the job running on this box, with phase, step, set, bytes done of total, %, rate, ETA, and since
+  when. The phases are backup, push, restore test, offsite, scrub, staged upgrade. The steps:
+  - backup: bench backup → copy out → verify → encrypt
+  - push: notice → archives → markers → standby set → manifest
+  - restore test: waiting for the push → copy in → bench restore → checks
+- **LAST**: the last finished job.
+- On a receiving box, **PEER / IN**: what the sender announced, and each set still arriving, sized on disk
+  against that.
+
+How it works:
+
+- Pushes feed `rsync --info=progress2 --stats` into `bin/progress.py`. Those flags are client-side only,
+  so the peer's rrsync never sees them.
+- Encryption is sampled from the bytes written so far.
+- Steps with no byte counter (bench backup, bench restore) estimate from the last run's duration, marked
+  "(est.)".
+- The same data goes into `status.json` under `progress`, refreshed at most once a minute while a job runs.
+  The 2-minute `erp-progress` timer refreshes it while a set is arriving.
+
+The nightly runs are also in the journal:
+
+- `journalctl -u erp-backup.service -f` (backup + push)
+- `journalctl -u erp-standby.service -f` (restore test)
+- `journalctl -u erp-push.service -f` (a push resumed after a failure)
+
+A manual `run-now.sh` prints to its terminal instead.
 
 ## Status, alerts, notifications
 
@@ -137,6 +202,8 @@ changed. `oml` and `umbrellocal` remain accepted as role names for boxes install
 | Command | |
 |---|---|
 | `bin/status.sh` | Read-only report, safe to paste anywhere (no secrets). |
+| `bin/progress.sh [--watch [N]] [--json]` | Live progress of the running backup / push / restore and of sets arriving from the peer. |
+| `bin/link-test.sh` | Path to the peer: reachable, host key pinned, key jailed, and direct vs DERP relay, plus the last push's rate. |
 | `bin/run-now.sh [--push-only] [--restore]` | Back up, push and copy to the second target now, and print a summary. Waits for a push already running. `--push-only` skips the backup and just sends what is waiting. `--restore` (secondary) also runs the restore test now. |
 | `bin/stage-upgrade.sh --image=IMAGE` | Secondary only. Restores a copy of the standby into a throwaway ERPNext built from IMAGE, runs `bench migrate`, checks it, then removes it. Use it before any image or framework upgrade. |
 | `bin/offsite.sh config` | Create the rclone remote for a second target (interactive). |

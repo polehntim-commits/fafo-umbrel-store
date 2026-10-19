@@ -33,6 +33,7 @@ from frappe.utils.password import get_encryption_key, set_encrypted_password
 get_encryption_key(); set_encrypted_password("User", "Administrator", "e2e-test-secret", "api_secret"); frappe.db.commit()
 frappe.destroy()
 PY
+docker exec -u frappe "$CONT_A" sh -c 'mkdir -p /home/frappe/frappe-bench/sites/frontend/private/files && head -c 25165824 /dev/urandom > /home/frappe/frappe-bench/sites/frontend/private/files/e2e-photo.bin'
 
 echo "== reset: drop a standby site left by an earlier run"
 if docker exec "$CONT_B" test -d /home/frappe/frappe-bench/sites/standby-alpha; then
@@ -53,9 +54,11 @@ check "refuses primary role on a non-primary host" bash -c "! ERP_KIT_HOSTNAME=o
 check "refuses secondary role on the primary host" bash -c "! ERP_KIT_HOSTNAME=boxa bash $KIT secondary --root=$B >/dev/null 2>&1"
 check "re-install keeps names and hosts" bash -c "ERP_KIT_HOSTNAME=boxa bash $KIT primary --root=$A >/dev/null && grep -q '^PEER_HOST=boxb.example' $A/erp-backup/erp-backup.conf"
 mkdir -p "$B/erp-backup-from-alpha" "$A/erp-backup-from-beta"
+export FAKE_SSH_MAP="boxb.example=$B/erp-backup-from-alpha,boxa.example=$A/erp-backup-from-beta" ERP_KIT_TEST_RSH=/usr/local/bin/fake-ssh
 for R in "$A" "$B"; do
   echo "$RCPT" | run "$R" set-recipient.sh >/dev/null
-  run "$R" set-conf.sh PUSH_TRANSPORT local >/dev/null
+  mkdir -p "$R/erp-backup/keys"; echo dummy > "$R/erp-backup/keys/send_ed25519"; echo "boxx ssh-ed25519 AAAA" > "$R/erp-backup/keys/known_hosts"
+  run "$R" set-conf.sh PUSH_TRANSPORT ssh >/dev/null
   run "$R" set-conf.sh SEND_ENABLED 1 >/dev/null
   run "$R" set-conf.sh RECV_ENABLED 1 >/dev/null
   run "$R" set-conf.sh NOTIFY_URL http://127.0.0.1:18765/ >/dev/null
@@ -78,6 +81,9 @@ check "push OK with duration recorded" bash -c "[ \"$(st "$A" push result)\" = O
 check "peer got the complete encrypted set" test -f "$B/erp-backup-from-alpha/daily/$SET1/SHA256SUMS"
 check "peer got the complete standby set" test -f "$B/erp-backup-from-alpha/standby/$SET1/MANIFEST.sha256"
 check "peer got the primary's status" test -f "$B/erp-backup-from-alpha/receipts/status-alpha.json"
+check "push went over the ssh transport (fake-ssh -> the real rrsync jail)" [ "$(st "$A" push transport)" = ssh ]
+check "push recorded bytes sent and rate" bash -c "[ \"\$(sed -n 's/^bytes_sent=//p' $A/erp-backup/state/push.env)\" -gt 20000000 ] && grep -q '^rate_kbps=' $A/erp-backup/state/push.env"
+check "the peer was told what was coming (inflight notice, done)" bash -c "grep -q '\"state\":\"done\"' $B/erp-backup-from-alpha/receipts/inflight-alpha.json"
 
 echo "== one push at a time (2026-10-19.2)"
 ( exec 8>"$A/erp-backup/.push.lock"; flock 8; sleep 25 ) & HOLD=$!; sleep 2
@@ -111,6 +117,64 @@ PUSH_RETRY_SLEEP=1 run "$A" run-now.sh --push-only > /t/pushonly.log 2>&1 || tru
 check "run-now --push-only sends without a new backup" bash -c "[ \"$(st "$A" backup set)\" = '$BS' ] && [ \"$(st "$A" push set)\" = '$BS' ] && ! grep -q '^== backup' /t/pushonly.log"
 check "the waiting standby set went with it" test -f "$B/erp-backup-from-alpha/standby/$BS/MANIFEST.sha256"
 
+echo "== live progress (2026-10-19.3)"
+run "$A" set-conf.sh PUSH_BWLIMIT_KBPS 1500 >/dev/null
+sleep 61; run "$A" backup.sh >/dev/null
+( PUSH_RETRY_SLEEP=1 ERP_KIT_HOSTNAME=x bash "$A/erp-backup/bin/push.sh" > /t/push-slow.log 2>&1 ) & SLOW=$!
+sleep 12
+ERP_KIT_HOSTNAME=x bash "$A/erp-backup/bin/progress.sh" > /t/prog-a.txt 2>&1 || true
+ERP_KIT_HOSTNAME=x bash "$B/erp-backup/bin/progress.sh" > /t/prog-b.txt 2>&1 || true
+ERP_KIT_HOSTNAME=x bash "$A/erp-backup/bin/progress.sh" --json > /t/prog-a.json 2>&1 || true
+echo "== re-install while that push runs (atomic writes keep it alive)"
+ERP_KIT_HOSTNAME=boxa bash "$KIT" primary --root="$A" --no-wait > /t/inst-nowait.log 2>&1 && NW=ok || NW=refused
+ERP_KIT_HOSTNAME=boxa bash "$KIT" primary --root="$A" --force > /t/inst-force.log 2>&1 || true
+wait $SLOW && SLOWRC=0 || SLOWRC=$?
+sed -n '1,4s/^/    /p' /t/prog-a.txt; grep -E '^(IN|PEER)' /t/prog-b.txt | sed 's/^/    /' || true
+check "progress.sh on the sender shows the push step with % and rate" bash -c "grep -q '^NOW   push:' /t/prog-a.txt && grep -qE '[0-9]+%' /t/prog-a.txt && grep -q '/s' /t/prog-a.txt"
+check "progress.sh on the receiver shows the set arriving" grep -qE '^(IN    from alpha: (daily|standby) .*%|PEER  alpha is sending)' /t/prog-b.txt
+check "--json carries the live step" python3 -c "import json; d=json.load(open('/t/prog-a.json')); assert d['current']['phase']=='push' and d['current']['bytes_done']>0"
+check "the installer refuses with --no-wait while a push runs" [ "$NW" = refused ]
+check "an install during a running push does not break it" [ "$SLOWRC" = 0 ]
+check "status.json carries the last activity for ERPNext" bash -c "run_r() { :; }; python3 -c \"import json; d=json.load(open('$A/erp-backup/status.json')); assert d['progress']['last']['phase']=='push'\""
+run "$A" set-conf.sh PUSH_BWLIMIT_KBPS 0 >/dev/null
+
+echo "== installer waits (no --force) until the job ends"
+( exec 8>"$A/erp-backup/.push.lock"; flock 8; sleep 20 ) & HOLD=$!; sleep 1
+ERP_KIT_HOSTNAME=boxa timeout 120 bash "$KIT" primary --root="$A" > /t/inst-wait.log 2>&1 && IW=ok || IW=fail
+wait $HOLD || true
+check "the installer waited, then installed" bash -c "grep -q 'waiting for running erp-backup jobs' /t/inst-wait.log && [ $IW = ok ] && grep -qx 2026-10-19.3 $A/erp-backup/KIT_VERSION"
+
+echo "== memory pre-check: MemAvailable, and swap only when active"
+printf 'MemAvailable: 3670016 kB\nSwapTotal: 4718592 kB\nSwapFree: 419430 kB\n' > /t/meminfo; printf 'pswpin 1000\n' > /t/vmstat; printf 'some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n' > /t/psi-idle; printf 'some avg10=35.00 avg60=20.00 avg300=5.00 total=9\n' > /t/psi-busy
+memtest() { ERP_MEMINFO=/t/meminfo ERP_VMSTAT=/t/vmstat ERP_PSI="$1" MEM_SAMPLE_S=1 bash -c ". $B/erp-backup/bin/common.sh; . $B/erp-backup/bin/lib-site.sh; mem_ok && echo RUN || echo DEFER; mem_desc"; }
+M1=$(memtest /t/psi-idle | sed -n 1p); M2=$(memtest /t/psi-busy | sed -n 1p)
+check "3.5 GiB available + 91% swap that is idle: restore runs" [ "$M1" = RUN ]
+check "the same with memory pressure (PSI): restore defers" [ "$M2" = DEFER ]
+echo "    $(memtest /t/psi-idle | sed -n 2p)"
+
+echo "== link probe: direct vs DERP relay"
+mkdir -p /t/fakets; cat > /t/fakets/tailscale <<'TS'
+#!/bin/bash
+case "$1" in
+  status) echo '{"TUN":false,"Peer":{"k":{"HostName":"boxb","DNSName":"boxb.example.ts.net.","TailscaleIPs":["100.64.0.2"],"Online":true,"CurAddr":"","Relay":"sea"}}}' ;;
+  ping) echo "pong from boxb (100.64.0.2) via DERP(sea) in 48ms" ;;
+esac
+TS
+chmod +x /t/fakets/tailscale
+LP=$(PATH=/t/fakets:$PATH bash -c ". $A/erp-backup/bin/common.sh; TS_MODE=direct; link_probe")
+check "relayed path read from tailscale status/ping" bash -c "echo '$LP' | grep -qx path=derp && echo '$LP' | grep -qx derp=sea && echo '$LP' | grep -qx tun=no"
+bash -c ". $A/erp-backup/bin/common.sh; state_put link at=\"\$(date -Is)\" path=derp derp=sea tun=no"; run "$A" report.sh
+check "LINK_RELAYED alert raised" bash -c "grep -q LINK_RELAYED $A/erp-backup/status.json"
+rm -f "$A/erp-backup/state/link.env"
+
+echo "== a failed push is resumed by the 2-minute tick"
+bash -c ". $A/erp-backup/bin/common.sh; state_put push result=FAIL at=\"\$(date -Is -d '-2 hours')\" msg=simulated set=none"
+run "$A" set-conf.sh PUSH_RESUME_AFTER_MIN 0 >/dev/null
+rm -f /t/systemd/erp-push.service; run "$A" tick.sh >/dev/null 2>&1 || true
+for _ in $(seq 1 30); do [ "$(st "$A" push result)" = OK ] && break; sleep 2; done
+check "tick resumed the push and it succeeded" bash -c "[ \"$(st "$A" resume count)\" = 1 ] && [ \"$(st "$A" push result)\" = OK ]"
+run "$A" set-conf.sh PUSH_RESUME_AFTER_MIN 60 >/dev/null
+
 echo "== secondary: first standby build"
 run "$B" standby-init.sh --force > /t/standby-init.log 2>&1 || { tail -n 20 /t/standby-init.log; bad "standby-init"; }
 check "standby site exists" docker exec "$CONT_B" test -f /home/frappe/frappe-bench/sites/standby-alpha/site_config.json
@@ -119,14 +183,18 @@ check "standby-init check Pass" [ "$(st "$B" standby check)" = Pass ]
 echo "== the 2026-10-17 failure: a newer set cut off in transfer"
 sleep 61   # backup stamps are per minute
 run "$A" backup.sh >/dev/null; SET2=$(st "$A" backup set)
-PUSH_RETRY_SLEEP=1 run "$A" push.sh >/dev/null
+PUSH_RETRY_SLEEP=1 run "$A" push.sh > /t/push-delta.log 2>&1
+SENT2=$(st "$A" push bytes_sent); SBB2=$(st "$A" push standby_bytes); NEWB2=$(st "$A" push new_set_bytes)
+check "the standby set went as a delta against the peer's basis (rrsync accepted -yy --copy-dest --mkpath)" bash -c "[ \"$(st "$A" push delta_standby)\" = 1 ] && [ $SENT2 -lt $(( NEWB2 + SBB2 / 2 )) ]"
+echo "  (night 2: $((SENT2 / 1048576)) MB sent for a $((NEWB2 / 1048576)) MB encrypted set + $((SBB2 / 1048576)) MB standby set)"
 CUT=$(date -d '+1 day' +%F)_0232
 cp -a "$B/erp-backup-from-alpha/standby/$SET2" "$B/erp-backup-from-alpha/standby/$CUT"; rm -f "$B/erp-backup-from-alpha/standby/$CUT/MANIFEST.sha256"
 touch -d '-2 days' "$B/erp-backup-from-alpha/standby/$CUT"
-STANDBY_WAIT_MIN=0 run "$B" standby-refresh.sh --now --force > /t/refresh.log 2>&1 || { tail -n 20 /t/refresh.log; bad "standby-refresh"; }
+run "$B" standby-refresh.sh --now --force --wait-min=0 > /t/refresh.log 2>&1 || { tail -n 20 /t/refresh.log; bad "standby-refresh"; }
 check "refresh restored the newest COMPLETE set" [ "$(st "$B" standby set)" = "$SET2" ]
 check "refresh check Pass (files emptied first: no stale extras)" [ "$(st "$B" standby check)" = Pass ]
 check "sanity compared" [ "$(st "$B" standby sanity_ok)" = yes ]
+check "the restored set is kept as the next delta basis" bash -c "test -f $B/erp-backup-from-alpha/standby/.basis/MANIFEST.sha256 && [ ! -e $B/erp-backup-from-alpha/standby/$SET2 ]"
 check "the cut-off set was reported" bash -c "grep -q '$CUT' $B/erp-backup/state/standby.env"
 run "$B" report.sh
 check "STANDBY_SET_INCOMPLETE raised" bash -c "echo '$(codes "$B")' | grep -q STANDBY_SET_INCOMPLETE"
@@ -136,6 +204,13 @@ check "receipt went back to the primary" test -f "$A/erp-backup-from-beta/receip
 run "$A" report.sh
 check "primary sees its restore as Pass" [ "$(js "$A" 'd["remote_restore_of_my_data"]["result"]')" = Pass ]
 check "primary has no REMOTE_RESTORE alerts" bash -c "! echo '$(codes "$A")' | grep -q REMOTE_RESTORE"
+
+echo "== the restore waits for a push the primary has announced but not finished"
+ANNS=$(date -d '+3 days' +%F)_0232
+printf '{"schema":"erp-backup-inflight/1","box":"alpha","state":"sending","set":"%s","archive_bytes":1,"standby_set":"%s","standby_bytes":1,"started_at":"%s","updated_at":"%s"}\n' "$ANNS" "$ANNS" "$(date -Is)" "$(date -Is)" > "$B/erp-backup-from-alpha/receipts/inflight-alpha.json"
+STANDBY_WAIT_POLL_S=10 run "$B" standby-refresh.sh --now --force --wait-min=1 > /t/announce.log 2>&1 || true
+check "waited for the announced set before falling back" bash -c "grep -q 'announced' /t/announce.log && grep -qE 'standby already at|refreshed to|standby stays at' /t/announce.log"
+rm -f "$B/erp-backup-from-alpha/receipts/inflight-alpha.json"
 
 echo "== a set still arriving is waited for, not failed on"
 ARR=$(date -d '+2 days' +%F)_0232

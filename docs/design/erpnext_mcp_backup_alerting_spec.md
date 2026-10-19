@@ -91,6 +91,54 @@ All of these are additive; older files keep working.
 - New critical codes for the levels table: `OFFSITE_FAILED`, `SCRUB_FAILED`, `TIMERS_MISSING`.
 - A receipt with `sanity_ok` other than `yes` maps to `REMOTE_RESTORE_NOT_PASS` with the reason.
 
+## 4b. Live progress (kit 2026-10-19.3)
+
+Each box's status file now carries `progress` (schema `erp-backup-progress/1`, written by `bin/progress.py`).
+While a job runs it is refreshed at most once a minute. On a box with a set arriving, the 2-minute
+`erp-progress` timer refreshes it.
+
+```json
+"progress": {
+  "current": {"phase": "push", "step": "encrypted archives (1/4)", "set": "2026-10-19_0232",
+              "bytes_done": 412000000, "bytes_total": 590000000, "pct": 69.8, "rate_bps": 118000, "eta_s": 1508,
+              "step_started_at": "...", "job_started_at": "...", "updated_at": "..."},
+  "last":    {"phase": "backup", "result": "OK", "set": "...", "finished_at": "...", "job_duration_s": 81, "note": "563 MB encrypted"},
+  "incoming": {"from": "oml", "sender": {"state": "sending", "set": "...", "archive_bytes": 590000000, "standby_bytes": 580000000},
+               "sets": [{"kind": "daily", "set": "...", "bytes_on_disk": 233000000, "bytes_expected": 590000000,
+                         "pct": 39.5, "rate_bps": 120000, "eta_s": 2980, "stalled": false}]}
+}
+```
+
+- **`current`**
+  - `phase` is one of: backup, push, restore test, offsite, scrub, staged upgrade.
+  - `step` is what it is doing now: bench backup, copy out, encrypt, notice / archives / markers /
+    standby set / manifest, waiting for the peer's push, copy in, bench restore, checks.
+  - `pct` and `eta_s` come from bytes when they're known. Otherwise they come from the last run's
+    duration, and the record carries `"estimate"`.
+  - `current` is `null` when idle, or when the job's process is gone (stale).
+- **`incoming`** (receiving box only): sets from the peer that have no completion marker yet, sized on
+  disk against what the sender announced.
+- **Push stats**: `push.bytes_sent`, `push.rate_kbps`, `push.duration_s` and `push.new_set_bytes` /
+  `standby_bytes` are on every push. The standby restore receipt carries `waited_for_push_s` and
+  `progress.restore_s`.
+
+What erpnext_mcp does with it:
+
+- `get_backup_status` returns `progress` per box as-is, and adds `progress_age_s` (now minus
+  `updated_at`). A `current` older than 5 minutes is shown as "last seen", not as live.
+- **Today card** (System Managers): while `current` is set, show one line:
+  "Backup: push 70% · 115 KB/s · ~25 min left (set 2026-10-19_0232)". `incoming` on the secondary reads
+  "Receiving from OML: 40% …". When idle, show the `last` result line. No push notifications for progress,
+  only for the alerts in section 2.
+- **`get_owner_dashboard` `backups` block**: add `now` (`current` compressed to phase/step/pct/eta),
+  `last_activity`, and `last_push_rate_kbps`.
+- **New warning codes** (raise and clear like the rest):
+  - `LINK_RELAYED`: pushes go through a DERP relay.
+  - `LINK_SLOW`: the last push of more than 50 MB ran below `LINK_MIN_RATE_KBPS`.
+  - `INCOMING_STALLED`: a set has been arriving for more than 6 h without growing.
+
+  Add them to the levels table as warnings.
+
 ## 5. Ingest
 
 - `push.result == FAIL` → a Backup Record:

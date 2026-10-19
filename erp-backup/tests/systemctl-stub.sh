@@ -6,6 +6,8 @@ case "$1" in
   is-enabled) [ "$2" = --quiet ] && shift; [ -f "$SD/$2" ] && [ -f "$SD/.enabled.$2" ] ;;
   enable) shift; [ "$1" = --now ] && shift; touch "$SD/.enabled.$1" ;;
   disable) shift; [ "$1" = --now ] && shift; rm -f "$SD/.enabled.$1" ;;
+  is-active) [ "$2" = --quiet ] && shift; [ -f "$SD/.active.$2" ] ;;
+  stop|start) shift; [ "$1" = --no-block ] && shift; exit 0 ;;
   show) echo success ;;
   *) exit 0 ;;
 esac
