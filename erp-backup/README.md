@@ -152,6 +152,30 @@ The nightly runs are also in the journal:
 
 A manual `run-now.sh` prints to its terminal instead.
 
+## Every restore run says how it ended
+
+From 2026-10-19.4, every run of `standby-refresh.sh` writes one `status.log` line and `state/standby_run.env`, and
+`status.sh` shows the last one. The possible outcomes:
+
+- `restored` (with the check result)
+- `already-current`
+- `no-new-set`
+- `waiting-for-peer`: the peer's shared status names a newer backup that has not arrived complete. The message
+  says which, and how the peer's last push went. It raises `STANDBY_WAITING_FOR_PEER`.
+- `deferred`
+- `not-due`
+- `failed`
+
+When a complete set lands after a run gave up (no-new-set / waiting-for-peer / deferred / failed), the 2-minute
+`erp-progress` tick starts a **catch-up restore** through the on-demand `erp-standby-now.service`, at most
+`STANDBY_CATCHUP_MAX_PER_DAY` (4) a day.
+
+Earlier kits exited 0 with only a journal line when nothing new had arrived. That is how a standby box's 05:32 run
+on 2026-10-19 "succeeded" without a trace while the 0403 set was still on its way.
+
+The restore timer runs at `STANDBY_AT`. `STANDBY_TIME` (older kits) was never read for that, and the installer
+now comments it out.
+
 ## Status, alerts, notifications
 
 `report.sh` writes `status.json` (schema `erp-backup-status/1`, additive) and copies it into the ERPNext
@@ -178,7 +202,7 @@ Alert codes the kit raises:
   - `TIMERS_MISSING`, `STATUS_NOT_IN_CONTAINER`
   - `STANDBY_SET_INCOMPLETE`, `PEER_SET_INCOMPLETE`
 
-`NOTIFY_URL` is optional. When set, the watchdog POSTs a one-line message to it; an ntfy topic URL is
+`NOTIFY_URL` is optional. From 2026-10-19.4 the 2-minute tick checks as well as the daily watchdog, so a new problem goes out within minutes. Nothing counts as announced while `NOTIFY_URL` is empty or a send fails. Setting it with `set-conf.sh` sends a test message, then every problem already open. `ARCHIVE_TEST_DUE_SOON` warns 7 days (`ARCHIVE_TEST_WARN_DAYS`) before the `ARCHIVE_TEST_MAX_DAYS` limit (30 for new installs). When set, the watchdog POSTs a one-line message to it; an ntfy topic URL is
 one option. Set it with `sudo bash bin/set-conf.sh NOTIFY_URL --prompt` so it never lands in shell
 history.
 

@@ -19,7 +19,7 @@
 # (new keys are appended; change values with bin/set-conf.sh). Never edits app compose files or app-data, never
 # restarts the ERPNext containers, never writes secrets to disk. Hosts, names and paths live only in the conf.
 set -euo pipefail
-KIT_VERSION="2026-10-19.3"
+KIT_VERSION="2026-10-19.4"
 
 ROLE="${1:-}"; [ $# -gt 0 ] && shift
 ARG_ME=""; ARG_PEER=""; ARG_PEER_HOST=""; ARG_PRIMARY_HOSTNAME=""; ARG_CONTAINER=""; FORCE_INSTALL=0; NO_WAIT=0
@@ -85,7 +85,7 @@ SDIR_SYS="${ERP_KIT_SYSTEMD_DIR:-/etc/systemd/system}"
 self_or_ancestor() { local q="$$"; while [ -n "$q" ] && [ "$q" -ge 1 ] 2>/dev/null; do [ "$q" = "$1" ] && return 0; [ "$q" = 1 ] && break; q=$(awk '/^PPid:/{print $2}' "/proc/$q/status" 2>/dev/null); done; return 1; }
 busy_now() { # prints what is running, empty if nothing
   local u f p out=""
-  for u in erp-backup erp-push erp-standby erp-recv-check erp-offsite erp-scrub erp-watchdog; do
+  for u in erp-backup erp-push erp-standby erp-standby-now erp-recv-check erp-offsite erp-scrub erp-watchdog; do
     systemctl is-active --quiet "$u.service" 2>/dev/null && out="$out $u.service"
   done
   for f in .lock .push.lock .standby.lock .offsite.lock .scrub.lock .stage.lock; do
@@ -134,7 +134,6 @@ addconf KEEP_WEEKLY 8
 addconf KEEP_MONTHLY 12
 addconf WEEKLY_DOW 7
 addconf BACKUP_TIME "$BACKUP_TIME"
-addconf STANDBY_TIME "$STANDBY_TIME"
 addconf CHECK_TIME "$CHECK_TIME"
 addconf PEER_NAME "$PEER_NAME"
 addconf PEER_HOST "$PEER_HOST"
@@ -148,12 +147,13 @@ addconf SEND_STANDBY_SET "$SEND_STANDBY_SET"
 addconf STANDBY_ENABLED 0
 addconf ALLOW_STANDBY "$ALLOW_STANDBY"
 addconf EXPECT_REMOTE_RESTORE "$EXPECT_REMOTE_RESTORE"
-addconf ARCHIVE_TEST_MAX_DAYS 35
+addconf ARCHIVE_TEST_MAX_DAYS 30
+addconf ARCHIVE_TEST_WARN_DAYS 7
 addconf DB_CONTAINER '""'
 addconf DBPW_SOURCE auto
 addconf STANDBY_EVERY "$STANDBY_EVERY"
 addconf STANDBY_DAY Sun
-addconf STANDBY_AT 03:00
+addconf STANDBY_AT "$STANDBY_TIME"
 addconf STANDBY_MIN_AVAIL_MB 2500
 addconf STANDBY_MAX_SWAP_PCT 80
 addconf STANDBY_STOP_APPS_ENABLED 0
@@ -193,6 +193,11 @@ addconf STAGE_IMAGE '""'
 addconf STAGE_DB_IMAGE mariadb:10.6
 addconf STAGE_PORT 8090
 addconf STAGE_MIN_AVAIL_MB 3500
+addconf STANDBY_CATCHUP_MAX_PER_DAY 4
+# STANDBY_TIME (kits before 2026-10-19.4) was shadowed by STANDBY_AT and confused anyone reading the conf: retire it
+if grep -q '^STANDBY_TIME=' "$CONF"; then
+  sed -i 's/^STANDBY_TIME=\(.*\)$/# STANDBY_TIME=\1   (unused since 2026-10-19.4 - the restore timer runs at STANDBY_AT)/' "$CONF"; echo "  conf: STANDBY_TIME retired (the restore timer uses STANDBY_AT=$(sed -n 's/^STANDBY_AT=//p' "$CONF"))"
+fi
 
 # ---------------------------------------------------------------- common.sh (shared helpers)
 cat > "$NB/common.sh" <<'EOF_COMMON'
@@ -208,8 +213,37 @@ AGE="$BASE/bin/age"; [ -x "$AGE" ] || AGE="$(command -v age || echo "$BASE/bin/a
 DOCTYPES=("GL Entry" "Journal Entry" "Sales Invoice" "Purchase Invoice" "Payment Entry" "Employee" "File")
 log()    { echo "$(date -Is) [$ME/$STAGE] $*"; }
 status() { echo "$(date -Is) $*" >> "$STATUS"; }
-notify() { if [ -n "${NOTIFY_URL:-}" ]; then curl -fsS -m 10 -d "[$ME] $*" "$NOTIFY_URL" >/dev/null 2>&1 || true; fi; }
-die()    { log "FAIL: $*"; status "FAIL $STAGE $*"; notify "FAIL $STAGE $*"; state_fail "$STAGE" "$*"; prog end FAIL "$*"; report_quiet; exit 1; }
+notify() { notify_send "$*" || true; }
+notify_send() { [ -n "${NOTIFY_URL:-}" ] || return 2; curl -fsS -m 15 -d "[$ME] $*" "$NOTIFY_URL" >/dev/null 2>&1; }
+# notify_check: one message when the set of problems in status.json changes (or NOTIFY_REPEAT_HOURS pass), one
+# "recovered" when it clears. Nothing is remembered while NOTIFY_URL is empty or a send fails, so problems that
+# exist when notifications are switched on are announced at the first check after that, not swallowed.
+notify_check() {
+  [ -n "${NOTIFY_URL:-}" ] && [ -f "$BASE/status.json" ] || return 0
+  local overall codes msg lastc lastat age
+  read -r overall codes msg < <(python3 - "$BASE/status.json" <<'PY'
+import json, sys
+try: s = json.load(open(sys.argv[1]))
+except Exception: print("critical STATUS_UNREADABLE status.json unreadable"); raise SystemExit
+codes = sorted({a["code"] for a in s.get("alerts", [])})
+msg = "; ".join(f'{a["code"]}: {a["message"]}' for a in s.get("alerts", []))[:600].replace("\n", " ")
+print(s.get("overall", "critical"), ",".join(codes) or "-", msg or "-")
+PY
+)
+  lastc=$(state_get notify codes); lastat=$(state_get notify at); age=999
+  [ -n "$lastat" ] && age=$(( ( $(date +%s) - $(date -d "$lastat" +%s) ) / 3600 ))
+  if [ "$overall" != ok ]; then
+    if [ "$codes" != "$lastc" ] || [ "$age" -ge "${NOTIFY_REPEAT_HOURS:-24}" ]; then
+      notify_send "$overall - $msg" && state_put notify at="$(date -Is)" codes="$codes" overall="$overall"
+    fi
+  elif [ -n "$lastc" ] && [ "$lastc" != "-" ]; then
+    notify_send "recovered: backups ok again (was: $lastc)" && state_put notify at="$(date -Is)" codes="-" overall=ok
+  fi
+  return 0
+}
+die()    { log "FAIL: $*"; status "FAIL $STAGE $*"; notify "FAIL $STAGE $*"; state_fail "$STAGE" "$*"; prog end FAIL "$*"
+           [ "$STAGE" = standby ] && state_put standby_run at="$(date -Is)" outcome=failed reason="$*" trigger="${ERPB_TRIGGER:-timer}"
+           report_quiet; exit 1; }
 # live progress (progress.py): prog begin PHASE STEP SET [--total BYTES] [--expect SECONDS] | prog bytes N [TOTAL] | prog end RESULT [NOTE]
 prog() { ERPB_STATE="$STATE" ERPB_ME="$ME" ERPB_PEER="$PEER_NAME" ERPB_RECV_DIR="${RECV_DIR:-}" ERPB_REPORT="$_BIN_DIR/report.sh" \
            python3 "$_BIN_DIR/progress.py" "$@" 2>/dev/null || true; }
@@ -667,7 +701,25 @@ start_apps() {
   done
   STOPPED_APPS=""
 }
+# run_note OUTCOME LEVEL REASON: EVERY way a standby refresh ends leaves one status.log line and state/standby_run.env
+# (2026-10-19.4: a run that found nothing new used to exit 0 with only a journal line - status.sh showed nothing)
+run_note() {
+  status "$2 standby $1: $3"
+  state_put standby_run at="$(date -Is)" outcome="$1" reason="$3" set="${SN:-}" last_restored="${LAST:-}" waited_s="${WAITED:-0}" trigger="${ERPB_TRIGGER:-timer}"
+  log "$1: $3"
+}
+# peer_backup_hint: what the peer says about its newest backup and its last push (from the status it shares)
+peer_backup_hint() {
+  python3 - "$RECV_DIR/receipts/status-$PEER_NAME.json" <<'PY' 2>/dev/null || true
+import json, sys
+try: s = json.load(open(sys.argv[1]))
+except Exception: raise SystemExit
+b, p = s.get("own_backup") or {}, s.get("push") or {}
+print(b.get("set") or "-", b.get("at") or "-", p.get("result") or "-", p.get("at") or "-", ((p.get("msg") or "")[:120].replace(" ", "_")) or "-")
+PY
+}
 defer_standby() { # record a skipped refresh (not a failure) and exit cleanly
+  state_put standby_run at="$(date -Is)" outcome=deferred reason="$1" trigger="${ERPB_TRIGGER:-timer}"
   state_put standby_defer at="$(date -Is)" reason="$1" mem_avail_mb="$MEM_AVAIL_MB" swap_pct="$SWAP_PCT"
   log "DEFERRED: $1"; status "DEFER standby $1"; notify "standby refresh deferred: $1"
   report_quiet; exit 0
@@ -1072,11 +1124,12 @@ trap 'die "unexpected error at line $LINENO"' ERR
 #   --wait-min=N waits at most N minutes for a set still arriving (default STANDBY_WAIT_MIN; 0 = do not wait).
 #   (An option, not an environment variable: the conf is sourced after the environment and would win.)
 NOW=0; FORCE=0; WAITMIN_ARG=""
-for a in "$@"; do case "$a" in --now) NOW=1;; --force) NOW=1; FORCE=1;; --wait-min=*) WAITMIN_ARG="${a#--wait-min=}";; *) die "unknown option $a";; esac; done
+for a in "$@"; do case "$a" in --now) NOW=1;; --force) NOW=1; FORCE=1;; --wait-min=*) WAITMIN_ARG="${a#--wait-min=}";;
+  --trigger=*) ERPB_TRIGGER="${a#--trigger=}";; *) die "unknown option $a";; esac; done
 [ -z "$WAITMIN_ARG" ] || [[ "$WAITMIN_ARG" =~ ^[0-9]+$ ]] || die "--wait-min needs a number of minutes"
-if [ "$STANDBY_ENABLED" != 1 ]; then log "STANDBY_ENABLED=0, skipping"; exit 0; fi
-if [ -f "$BASE/PROMOTED" ]; then log "box is PROMOTED; standby refresh disabled"; exit 0; fi
-if [ "$NOW" != 1 ] && ! standby_due; then log "standby refresh not due (STANDBY_EVERY=$STANDBY_EVERY, day $STANDBY_DAY; last $(state_get standby at))"; exit 0; fi
+if [ "$STANDBY_ENABLED" != 1 ]; then run_note disabled INFO "STANDBY_ENABLED=0 on this box"; report_quiet; exit 0; fi
+if [ -f "$BASE/PROMOTED" ]; then run_note promoted INFO "this box is PROMOTED; no standby refresh while it serves the peer's data"; report_quiet; exit 0; fi
+if [ "$NOW" != 1 ] && ! standby_due; then run_note not-due INFO "STANDBY_EVERY=$STANDBY_EVERY (day $STANDBY_DAY); last refresh $(state_get standby at)"; report_quiet; exit 0; fi
 exec 9>"$BASE/.standby.lock"; flock -n 9 || die "another standby refresh is running"
 SS="$STANDBY_SITE"; TMPD=/tmp/erp-standby; export TMPD TS="$SS"
 site_exists "$SS" || die "standby site $SS missing; run standby-init.sh"
@@ -1105,10 +1158,23 @@ SKIPPED="$(incomplete_sets "$RECV_DIR/standby" MANIFEST.sha256 | tr '\n' ' ')"; 
 [ -n "$SKIPPED" ] && log "skipping incomplete standby set(s): $SKIPPED"
 if [ -z "$SET" ]; then
   [ -n "$LAST" ] || die "no complete standby set from $PEER_NAME${SKIPPED:+ (incomplete: $SKIPPED)}"
-  log "no new complete standby set; standby stays at $LAST"; report_quiet; exit 0
+  read -r PB_SET PB_AT PP_RES PP_AT PP_MSG <<<"$(peer_backup_hint)"
+  for v in PB_SET PB_AT PP_RES PP_AT PP_MSG; do if [ "${!v:-}" = - ]; then printf -v "$v" '%s' ""; fi; done
+  WAITNOTE=""; if [ "${WAITED:-0}" -gt 0 ]; then WAITNOTE=", after waiting ${WAITED}s"; fi
+  WHY="nothing newer than $LAST has arrived complete from $PEER_NAME${SKIPPED:+ (incomplete: $SKIPPED)}$WAITNOTE"
+  if [ -n "${PB_SET:-}" ] && [[ "$PB_SET" > "$LAST" ]]; then
+    prog end WAITING "$PEER_NAME's set $PB_SET has not arrived"
+    run_note waiting-for-peer WARN "$WHY; $PEER_NAME's newest backup is $PB_SET ($PB_AT), its last push: ${PP_RES:-?} at ${PP_AT:-?}${PP_MSG:+ (${PP_MSG//_/ })}. It is restored when it lands (erp-progress checks every 2 min)"
+  else
+    prog end OK "nothing new"
+    run_note no-new-set INFO "$WHY; $PEER_NAME has no newer backup${PB_SET:+ than $PB_SET}"
+  fi
+  report_quiet; exit 0
 fi
 SN=$(basename "$SET")
-if [ "$SN" = "$LAST" ] && [ "$(state_get standby result)" = OK ] && [ "$(state_get standby check)" = Pass ]; then log "standby already at $SN (check Pass)"; rm -f "$STATE/standby_defer.env"; exit 0; fi
+if [ "$SN" = "$LAST" ] && [ "$(state_get standby result)" = OK ] && [ "$(state_get standby check)" = Pass ]; then
+  rm -f "$STATE/standby_defer.env"; prog end OK "already at $SN"; run_note already-current OK "standby already at $SN (check Pass)"; report_quiet; exit 0
+fi
 [ -z "$LAST" ] || [ "$LAST" = none ] || ! [[ "$SN" < "$LAST" ]] || die "newest complete standby set $SN is older than the one already loaded ($LAST)"
 # memory pre-flight: never start a restore that would push the box into swap thrash
 if [ "$FORCE" != 1 ] && ! mem_ok; then
@@ -1150,7 +1216,8 @@ state_put standby result=OK at="$(date -Is)" site="$SS" set="$SN" origin="$(cat 
   skipped_incomplete="$SKIPPED" waited_s="$WAITED" restore_s="$DUR" method=full-restore readonly=yes job=OK
 write_receipt "$SN" "$SS" "$DUR" full-restore
 prog end "$R" "restored in ${DUR}s"
-[ "$R" = Pass ] && status "OK standby $SN ${DUR}s check=Pass" || { status "WARN standby $SN ${DUR}s check=$R"; notify "standby check $R for $SN"; }
+state_put standby_run at="$(date -Is)" outcome=restored reason="check $R in ${DUR}s" set="$SN" last_restored="$LAST" waited_s="$WAITED" trigger="${ERPB_TRIGGER:-timer}"
+[ "$R" = Pass ] && status "OK standby restored: $SN ${DUR}s check=Pass (waited ${WAITED}s, ${ERPB_TRIGGER:-timer})" || { status "WARN standby restored: $SN ${DUR}s check=$R"; notify "standby check $R for $SN"; }
 log "standby $SS refreshed to $SN in ${DUR}s, check=$R"
 [ "$SEND_ENABLED" = 1 ] && bash "$(dirname "$0")/push.sh" receipts || true
 report_quiet
@@ -1590,24 +1657,10 @@ if [ "$SEND_ENABLED" = 1 ] && [ "${PUSH_TRANSPORT:-ssh}" = ssh ]; then   # how d
   state_put link at="$(date -Is)" $(link_probe | tr '\n' ' ') last_push_rate_kbps="$(state_get push rate_kbps)"
 fi
 bash "$(dirname "$0")/report.sh" >/dev/null 2>&1 || true
-read -r OVERALL CODES MSG < <(python3 - "$BASE/status.json" <<'PY'
-import json, sys
-try: s = json.load(open(sys.argv[1]))
-except Exception: print("critical STATUS_UNREADABLE status.json unreadable"); raise SystemExit
-codes = sorted({a["code"] for a in s.get("alerts", [])})
-msg = "; ".join(f'{a["code"]}: {a["message"]}' for a in s.get("alerts", []))[:600].replace("\n", " ")
-print(s.get("overall", "critical"), ",".join(codes) or "-", msg or "-")
-PY
-)
-LASTC=$(state_get notify codes); LASTAT=$(state_get notify at)
-AGE_H=999; [ -n "$LASTAT" ] && AGE_H=$(( ( $(date +%s) - $(date -d "$LASTAT" +%s) ) / 3600 ))
-if [ "$OVERALL" != ok ]; then
-  if [ "$CODES" != "$LASTC" ] || [ "$AGE_H" -ge "${NOTIFY_REPEAT_HOURS:-24}" ]; then
-    notify "$OVERALL - $MSG"; state_put notify at="$(date -Is)" codes="$CODES" overall="$OVERALL"
-  fi
-elif [ -n "$LASTC" ] && [ "$LASTC" != "-" ]; then
-  notify "recovered: backups ok again (was: $LASTC)"; state_put notify at="$(date -Is)" codes="-" overall=ok
-fi
+notify_check
+OVERALL=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("overall","?"))' "$BASE/status.json" 2>/dev/null || echo "?")
+CODES=$(python3 -c 'import json,sys; print(",".join(sorted({a["code"] for a in json.load(open(sys.argv[1])).get("alerts",[])})) or "-")' "$BASE/status.json" 2>/dev/null || echo "?")
+[ -n "${NOTIFY_URL:-}" ] || [ "$OVERALL" = ok ] || log "NOTIFY_URL is not set: nobody is told about: $CODES (set it: sudo bash $(dirname "$0")/set-conf.sh NOTIFY_URL --prompt)"
 log "overall=$OVERALL alerts=$CODES timers_missing=${MISS:-none}${REPAIRED:+ repaired=$REPAIRED} status_in_container=$INC"
 EOF_WATCH
 
@@ -1631,7 +1684,7 @@ if [ "$SEND_ENABLED" = 1 ]; then
   echo "== push to $PEER_NAME (waits for a push already in progress)"; PUSH_RETRY_SLEEP="${PUSH_RETRY_SLEEP:-60}" bash "$B/push.sh"
 fi
 [ "${TARGET2_KIND:-none}" != none ] && [ "$PUSHONLY" = 0 ] && { echo "== second target"; bash "$B/offsite.sh"; }
-[ "$RESTORE" = 1 ] && { echo "== restore test"; bash "$B/standby-refresh.sh" --now --wait-min=0; }
+[ "$RESTORE" = 1 ] && { echo "== restore test"; bash "$B/standby-refresh.sh" --now --wait-min=0 --trigger=run-now; }
 bash "$B/report.sh" >/dev/null 2>&1 || true
 python3 - "$BASE/status.json" <<'PY'
 import json, sys
@@ -1669,6 +1722,14 @@ setconf "$K" "$V"
 if [ "$SECRET" = 1 ]; then echo "$K updated (value not shown)"; status "OK set-conf $K (hidden)"
 else echo "$K: $OLD -> $V"; status "OK set-conf $K=$V"; fi
 case "$K" in *_TIME|*_AT|*_CALENDAR|*_ENABLED|TARGET2_KIND|STANDBY_EVERY) echo "Schedule changed: run  sudo bash $(dirname "$0")/install.sh";; esac
+if [ "$K" = NOTIFY_URL ]; then
+  . "$BASE/erp-backup.conf"
+  if [ -z "${NOTIFY_URL:-}" ]; then echo "Notifications are off."
+  elif notify_send "test: erp-backup notifications are on for $ME ($(hostname))"; then
+    echo "Test notification sent."; rm -f "$STATE/notify.env"; bash "$(dirname "$0")/report.sh" >/dev/null 2>&1 || true; notify_check
+    echo "Open problems (if any) were announced: $(python3 -c 'import json,sys; print(",".join(sorted({a["code"] for a in json.load(open(sys.argv[1])).get("alerts",[])})) or "none")' "$BASE/status.json" 2>/dev/null)"
+  else echo "WARN: the test notification could not be sent to that URL (check it, then set it again)."; fi
+fi
 EOF_SETCONF
 
 # ---------------------------------------------------------------- stage-upgrade.sh (on demand, standby box)
@@ -2104,7 +2165,30 @@ need_root
 ACTIVE=0
 [ -f "$STATE/progress.json" ] && ACTIVE=1
 if [ "$RECV_ENABLED" = 1 ] && [ -n "$(ERPB_STATE="$STATE" ERPB_PEER="$PEER_NAME" ERPB_RECV_DIR="$RECV_DIR" python3 "$(dirname "$0")/progress.py" incoming 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print("x" if d["sets"] or (d.get("sender") or {}).get("state")=="sending" else "")' 2>/dev/null)" ]; then ACTIVE=1; fi
-[ "$ACTIVE" = 1 ] && report_quiet
+# keep status.json (and its alerts, which are age-based) no older than 30 min even when idle
+if [ "$ACTIVE" = 1 ] || [ ! -f "$BASE/status.json" ] || [ $(( $(date +%s) - $(stat -c %Y "$BASE/status.json") )) -ge 1800 ]; then report_quiet; fi
+notify_check   # a failed backup at 02:30 is announced within minutes, not at the 07:45 watchdog
+# ---- catch-up restore (standby box): a complete set that landed after tonight's restore run gave up
+if [ "$STANDBY_ENABLED" = 1 ] && [ ! -f "$BASE/PROMOTED" ]; then
+  CS=$(newest_complete "$RECV_DIR/standby" MANIFEST.sha256); CL=$(state_get standby set); RO=$(state_get standby_run outcome); RAT=$(state_get standby_run at)
+  if [ -n "$CS" ] && { [ -z "$CL" ] || [[ "$(basename "$CS")" > "$CL" ]]; } && [[ " no-new-set waiting-for-peer deferred failed " == *" ${RO:-none} "* ]] \
+     && [ -n "$RAT" ] && [ $(( ( $(date +%s) - $(date -d "$RAT" +%s) ) / 60 )) -ge 10 ]; then
+    exec 7>"$BASE/.standby.lock"
+    if flock -n 7; then
+      exec 7>&-
+      TODAY=$(date +%F); CC=0; [ "$(state_get catchup day)" = "$TODAY" ] && CC=$(state_get catchup count)
+      if [ "${CC:-0}" -lt "${STANDBY_CATCHUP_MAX_PER_DAY:-4}" ]; then
+        state_put catchup day="$TODAY" count="$(( ${CC:-0} + 1 ))" at="$(date -Is)" set="$(basename "$CS")" after="$RO"
+        log "catch-up restore: $(basename "$CS") arrived after the last run ($RO at $RAT)"; status "OK tick catch-up restore of $(basename "$CS") (last run: $RO)"
+        if [ -f "${ERP_KIT_SYSTEMD_DIR:-/etc/systemd/system}/erp-standby-now.service" ] && command -v systemctl >/dev/null; then
+          systemctl start --no-block erp-standby-now.service
+        else
+          setsid bash "$(dirname "$0")/standby-refresh.sh" --now --trigger=catch-up >/dev/null 2>&1 < /dev/null &
+        fi
+      fi
+    else exec 7>&-; fi
+  fi
+fi
 [ "$SEND_ENABLED" = 1 ] || exit 0
 NEWEST=$(newest_complete "$BASE/own/daily" SHA256SUMS); [ -n "$NEWEST" ] || exit 0
 N=$(basename "$NEWEST"); PR=$(state_get push result); PS=$(state_get push set); PAT=$(state_get push at)
@@ -2138,7 +2222,7 @@ STAGE=report
 command -v python3 >/dev/null || exit 0
 ERPB_STATE="$STATE" ERPB_ME="$ME" ERPB_PEER="$PEER_NAME" ERPB_RECV_DIR="$([ "$RECV_ENABLED" = 1 ] && echo "$RECV_DIR")" \
   python3 "$(dirname "$0")/progress.py" snapshot > "$STATE/progress-snapshot.json.tmp" 2>/dev/null && mv "$STATE/progress-snapshot.json.tmp" "$STATE/progress-snapshot.json" || true
-ERPB_LINKMIN="${LINK_MIN_RATE_KBPS:-1000}" ERPB_STATE="$STATE" ERPB_ME="$ME" ERPB_PEER="$PEER_NAME" ERPB_HOST="$(hostname)" ERPB_KIT="$(cat "$BASE/KIT_VERSION" 2>/dev/null)" \
+ERPB_NOTIFY="$([ -n "${NOTIFY_URL:-}" ] && echo 1)" ERPB_ATWARN="${ARCHIVE_TEST_WARN_DAYS:-7}" ERPB_LINKMIN="${LINK_MIN_RATE_KBPS:-1000}" ERPB_STATE="$STATE" ERPB_ME="$ME" ERPB_PEER="$PEER_NAME" ERPB_HOST="$(hostname)" ERPB_KIT="$(cat "$BASE/KIT_VERSION" 2>/dev/null)" \
 ERPB_MAXAGE="$MAX_AGE_HOURS" ERPB_RECEIPT="$RECV_DIR/receipts/standby-of-$ME.json" ERPB_PROMOTED="$BASE/PROMOTED" ERPB_FENCED="$BASE/FENCED" \
 ERPB_T2="${TARGET2_KIND:-none}" ERPB_KD="$KEEP_DAILY" ERPB_KW="$KEEP_WEEKLY" ERPB_KM="${KEEP_MONTHLY:-12}" \
 ERPB_EVERY="$STANDBY_EVERY" ERPB_RRMAX="$REMOTE_RESTORE_MAX_HOURS" ERPB_EXPECT="$EXPECT_REMOTE_RESTORE" ERPB_ATMAX="$ARCHIVE_TEST_MAX_DAYS" ERPB_SEND="$SEND_ENABLED" ERPB_RECV="$RECV_ENABLED" ERPB_STANDBY="$STANDBY_ENABLED" ERPB_SITE="$SITE" ERPB_SS="$STANDBY_SITE" \
@@ -2161,7 +2245,8 @@ def old(d, limit):
     a = (d or {}).get("last_ok_age_hours", (d or {}).get("age_hours"))
     return a is None or a > limit
 st = {s: load(s) for s in ("backup", "push", "check", "standby", "archive_test", "install", "standby_defer",
-                          "offsite", "scrub", "watchdog", "stage", "link", "resume")}
+                          "offsite", "scrub", "watchdog", "stage", "link", "resume", "standby_run", "catchup")}
+if st["standby"]: st["standby"]["every_at_last_refresh"] = st["standby"].get("every"); st["standby"]["every"] = E.get("ERPB_EVERY") or "daily"
 try: progress = json.load(open(os.path.join(E["ERPB_STATE"], "progress-snapshot.json")))
 except Exception: progress = None
 for s, d in st.items():
@@ -2192,7 +2277,10 @@ if E["ERPB_SEND"] == "1":
         elif receipt.get("result") != "Pass": A("warning", "REMOTE_RESTORE_NOT_PASS", f"peer standby check: {receipt.get('result')}")
     else:
         at = st["archive_test"]
-        if at.get("result") != "OK" or old(at, float(E.get("ERPB_ATMAX") or 35) * 24): A("warning", "ARCHIVE_TEST_DUE", "no passing archive restore test of this box's backups in the last %s days (run archive-test.sh own)" % (E.get("ERPB_ATMAX") or 35))
+        atmax = float(E.get("ERPB_ATMAX") or 30); atwarn = float(E.get("ERPB_ATWARN") or 7)
+        if at.get("result") == "OK" and not old(at, atmax * 24) and old(at, (atmax - atwarn) * 24):
+            A("warning", "ARCHIVE_TEST_DUE_SOON", f"the last encrypted-archive restore test is {round((at.get('last_ok_age_hours') or 0) / 24)} days old; due within {atwarn:.0f} days (archive-test.sh own, with the age key)")
+        if at.get("result") != "OK" or old(at, atmax * 24): A("warning", "ARCHIVE_TEST_DUE", "no passing archive restore test of this box's backups in the last %s days (run archive-test.sh own)" % (E.get("ERPB_ATMAX") or 35))
 if E["ERPB_RECV"] == "1":
     c = st["check"]
     if c.get("result") == "FAIL" or old(c, 26): A("critical", "PEER_COPIES_BAD", c.get("msg", "receive check missing/old"))
@@ -2223,6 +2311,11 @@ if E["ERPB_SEND"] == "1" and lk.get("path") == "derp":
     A("warning", "LINK_RELAYED", f"pushes to the peer go through Tailscale's DERP relay ({lk.get('derp')}), not a direct path - expect about 1 Mbit/s; last push {st['push'].get('rate_kbps', '?')} KB/s")
 elif E["ERPB_SEND"] == "1" and st["push"].get("rate_kbps", "").isdigit() and int(st["push"]["rate_kbps"]) < int(E.get("ERPB_LINKMIN") or 1000) and int(st["push"].get("bytes_sent") or 0) > 50 * 1048576:
     A("warning", "LINK_SLOW", f"last push ran at {st['push']['rate_kbps']} KB/s ({lk.get('path') or 'path unknown'}{', userspace networking' if lk.get('tun') == 'no' else ''})")
+sr = st["standby_run"]
+if E["ERPB_STANDBY"] == "1" and sr.get("outcome") == "waiting-for-peer":
+    A("warning", "STANDBY_WAITING_FOR_PEER", sr.get("reason", ""))
+notices = []
+if not E.get("ERPB_NOTIFY"): notices.append("NOTIFY_URL is not set: problems are visible in status / ERPNext, but nobody is sent a message (set-conf.sh NOTIFY_URL --prompt)")
 if (progress or {}).get("incoming", {}).get("sets"):
     for e in progress["incoming"]["sets"]:
         if e.get("stalled"): A("warning", "INCOMING_STALLED", f"{e['kind']} set {e['set']} from the peer has not grown for 6 h ({e['bytes_on_disk']} bytes on disk)")
@@ -2240,6 +2333,7 @@ out = {
   "offsite": st["offsite"] if E.get("ERPB_T2", "none") != "none" else None, "target2_kind": E.get("ERPB_T2", "none"),
   "scrub": st["scrub"], "watchdog": st["watchdog"], "last_stage_upgrade": st["stage"] or None,
   "progress": progress, "link": st["link"] or None, "push_resume": st["resume"] or None,
+  "standby_last_run": st["standby_run"] or None, "standby_catchup": st["catchup"] or None, "notices": notices,
   "own_backup": b, "push": st["push"], "remote_restore_of_my_data": receipt,
   "peer_copies_check": st["check"], "standby_of_peer": st["standby"], "standby_deferred": st["standby_defer"] or None, "last_archive_test": st["archive_test"],
   "promoted": promoted, "fenced": os.path.exists(E["ERPB_FENCED"]),
@@ -2284,7 +2378,8 @@ on()  { install -m 644 "$BASE/systemd/$1.service" "$SD/$1.service"; install -m 6
 off() { systemctl disable --now "$1.timer" >/dev/null 2>&1 || true; rm -f "$SD/$1.service" "$SD/$1.timer"; }
 unit erp-backup        "ERPNext ($ME) encrypted backup + push to $PEER_NAME" "$BACKUP_TIME" backup.sh push.sh
 # weekly mode: wake daily at STANDBY_AT; the script refreshes on STANDBY_DAY, and retries the next nights after a deferral
-unit erp-standby       "ERPNext warm standby refresh of $PEER_NAME data ($STANDBY_EVERY)" "${STANDBY_AT:-$STANDBY_TIME}" standby-refresh.sh
+unit erp-standby       "ERPNext warm standby refresh of $PEER_NAME data ($STANDBY_EVERY)" "${STANDBY_AT:-05:30}" standby-refresh.sh
+unit erp-standby-now   "ERPNext standby catch-up restore (on demand; started by tick.sh when a set arrives late)" "*-*-* 00:00" "standby-refresh.sh --now --trigger=catch-up"
 unit erp-recv-check    "Verify ERPNext backups received from $PEER_NAME"      "$CHECK_TIME"  recv-check.sh
 unit erp-offsite       "Copy ERPNext ($ME) encrypted archives to the second target" "${TARGET2_TIME:-04:30}" offsite.sh
 unit erp-scrub         "Re-verify every stored ERPNext backup set"           "${SCRUB_CALENDAR:-Sun *-*-* 08:30:00}" scrub.sh
@@ -2298,6 +2393,8 @@ if [ "$RECV_ENABLED" = 1 ];    then on erp-recv-check; else off erp-recv-check; 
 if [ "$T2ON" = 1 ];            then on erp-offsite;    else off erp-offsite; fi
 on erp-scrub; on erp-watchdog; on erp-progress
 install -m 644 "$BASE/systemd/erp-push.service" "$SD/erp-push.service"; rm -f "$SD/erp-push.timer"   # service only, no timer
+if [ "$STANDBY_ENABLED" = 1 ]; then install -m 644 "$BASE/systemd/erp-standby-now.service" "$SD/erp-standby-now.service"; else rm -f "$SD/erp-standby-now.service"; fi
+rm -f "$SD/erp-standby-now.timer"
 systemctl daemon-reload
 for t in erp-backup:SEND_ENABLED erp-standby:STANDBY_ENABLED erp-recv-check:RECV_ENABLED erp-offsite:T2ON erp-scrub:ALWAYS erp-watchdog:ALWAYS erp-progress:ALWAYS; do
   n=${t%%:*}; v=${t##*:}; [ "${!v}" = 1 ] && systemctl enable --now "$n.timer" >/dev/null
@@ -2320,7 +2417,7 @@ echo "===== erp-backup status: $(hostname) role=$ME kit=$(cat "$BASE/KIT_VERSION
 [ -f "$BASE/PROMOTED" ] && echo "!!!!! PROMOTED: $(tr '\n' ' ' < "$BASE/PROMOTED")"
 [ -f "$BASE/FENCED" ] && echo "!!!!! FENCED: production site is read-only"
 echo "--- config"
-grep -E '^(CONTAINER|SITE|KEEP_|WEEKLY_DOW|BACKUP_TIME|STANDBY_TIME|CHECK_TIME|WATCHDOG_TIME|PEER_NAME|PEER_HOST|PRIMARY_HOSTNAME|RECV_DIR|MAX_AGE_HOURS|SEND_ENABLED|RECV_ENABLED|SEND_STANDBY_SET|STANDBY_ENABLED|ALLOW_STANDBY|EXPECT_REMOTE_RESTORE|STANDBY_SITE|PROMOTE_ALLOWED|ALLOW_ARCHIVE_TEST|PURGE_BENCH_PLAINTEXT|DB_CONTAINER|DBPW_SOURCE|STANDBY_EVERY|STANDBY_DAY|STANDBY_AT|STANDBY_WAIT_MIN|STANDBY_MIN_AVAIL_MB|STANDBY_MAX_SWAP_PCT|STANDBY_STOP_APPS_ENABLED|STANDBY_STOP_APPS|REMOTE_RESTORE_MAX_HOURS|TS_MODE|TS_CONTAINER|PUSH_TRANSPORT|PEER_LOCAL_DIR|PEER_STATUS_TO_CONTAINER|TARGET2_[A-Z_]+|RCLONE_IMAGE|SCRUB_CALENDAR|STAGE_[A-Z_]+|NOTIFY_REPEAT_HOURS)=' "$BASE/erp-backup.conf"
+grep -E '^(CONTAINER|SITE|KEEP_|WEEKLY_DOW|BACKUP_TIME|CHECK_TIME|WATCHDOG_TIME|PEER_NAME|PEER_HOST|PRIMARY_HOSTNAME|RECV_DIR|MAX_AGE_HOURS|SEND_ENABLED|RECV_ENABLED|SEND_STANDBY_SET|STANDBY_ENABLED|ALLOW_STANDBY|EXPECT_REMOTE_RESTORE|STANDBY_SITE|PROMOTE_ALLOWED|ALLOW_ARCHIVE_TEST|PURGE_BENCH_PLAINTEXT|DB_CONTAINER|DBPW_SOURCE|STANDBY_EVERY|STANDBY_DAY|STANDBY_AT|STANDBY_WAIT_MIN|STANDBY_MIN_AVAIL_MB|STANDBY_MAX_SWAP_PCT|STANDBY_STOP_APPS_ENABLED|STANDBY_STOP_APPS|REMOTE_RESTORE_MAX_HOURS|TS_MODE|TS_CONTAINER|PUSH_TRANSPORT|PEER_LOCAL_DIR|PEER_STATUS_TO_CONTAINER|TARGET2_[A-Z_]+|RCLONE_IMAGE|SCRUB_CALENDAR|STAGE_[A-Z_]+|NOTIFY_REPEAT_HOURS)=' "$BASE/erp-backup.conf"
 echo "ARCHIVE_RECIPIENT: $([ -n "${ARCHIVE_RECIPIENT:-}" ] && echo "${ARCHIVE_RECIPIENT:0:16}...${ARCHIVE_RECIPIENT: -6}" || echo NOT SET)   NOTIFY_URL set: $([ -n "${NOTIFY_URL:-}" ] && echo yes || echo no)"
 echo "age: $("$AGE" --version 2>/dev/null || echo MISSING)   db container: $(. "$BASE/bin/lib-site.sh"; find_db_container || true)"
 echo "--- containers / sites"
@@ -2331,6 +2428,8 @@ systemctl list-timers 'erp-*' --all --no-pager 2>/dev/null || true
 PP=$(other_push_pids | tr '\n' ' '); [ -n "${PP// /}" ] && echo "PUSH IN PROGRESS to $PEER_NAME: $(push_progress $PP)" || echo "no push in progress"
 echo "--- progress (progress.sh --watch for live)"; bash "$(dirname "$0")/progress.sh" 2>/dev/null | sed 's/^/  /'
 [ -f "$STATE/link.env" ] && echo "--- path to $PEER_NAME: $(tr '\n' ' ' < "$STATE/link.env")"
+[ -f "$STATE/standby_run.env" ] && echo "--- last restore-test run: $(grep -E '^(at|outcome|set|trigger|reason)=' "$STATE/standby_run.env" | tr '\n' ' ')"
+[ -n "${NOTIFY_URL:-}" ] || echo "NOTE: NOTIFY_URL is not set - nobody is sent a message about problems (set-conf.sh NOTIFY_URL --prompt)"
 for u in erp-backup erp-push erp-standby erp-recv-check erp-offsite erp-scrub erp-watchdog erp-progress; do echo "$u.service: $(systemctl show -p Result --value "$u.service" 2>/dev/null || echo n/a)"; done
 echo "--- last 15 status lines"
 tail -n 15 "$STATUS" 2>/dev/null || echo "(no status.log yet)"

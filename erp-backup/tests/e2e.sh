@@ -20,6 +20,8 @@ st()   { sed -n "s/^$3=//p" "$1/erp-backup/state/$2.env" 2>/dev/null | tail -n1;
 js()   { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); exec("try: print("+sys.argv[2]+")\nexcept Exception: print(\"?\")")' "$1/erp-backup/status.json" "$2"; }
 codes() { js "$1" '" ".join(sorted(a["code"] for a in d["alerts"]))'; }
 run()  { local r="$1"; shift; ERP_KIT_HOSTNAME=x bash "$r/erp-backup/bin/$@"; }
+# hold_lock FILE SECONDS: hold FILE's flock in the background for SECONDS; returns once it is really held
+hold_lock() { ( exec 8>>"$1"; flock 8; sleep "$2" ) & HOLD=$!; local i; for i in $(seq 1 40); do ( exec 9>>"$1"; flock -n 9 ) 2>/dev/null || return 0; sleep 0.25; done; }
 
 python3 /kit/tests/notify_sink.py 18765 /t/notify.log & SINK=$!
 trap 'kill $SINK 2>/dev/null || true' EXIT
@@ -86,7 +88,7 @@ check "push recorded bytes sent and rate" bash -c "[ \"\$(sed -n 's/^bytes_sent=
 check "the peer was told what was coming (inflight notice, done)" bash -c "grep -q '\"state\":\"done\"' $B/erp-backup-from-alpha/receipts/inflight-alpha.json"
 
 echo "== one push at a time (2026-10-19.2)"
-( exec 8>"$A/erp-backup/.push.lock"; flock 8; sleep 25 ) & HOLD=$!; sleep 2
+hold_lock "$A/erp-backup/.push.lock" 25
 PUSH_WAIT_POLL_S=5 PUSH_RETRY_SLEEP=999 timeout 300 bash -c "ERP_KIT_HOSTNAME=x bash $A/erp-backup/bin/push.sh" > /t/pushwait1.log 2>&1 || true
 wait $HOLD || true
 check "a second push waits for the one holding the lock" grep -q "another push holds" /t/pushwait1.log
@@ -107,7 +109,7 @@ chmod +x /t/shim/rsync
 PATH=/t/shim:$PATH PUSH_WAIT_POLL_S=2 PUSH_RETRY_SLEEP=999 timeout 300 bash -c "ERP_KIT_HOSTNAME=x bash $A/erp-backup/bin/push.sh" > /t/pushwait3.log 2>&1 || true
 check "the peer's rrsync lock is waited out, not counted as a failed attempt" bash -c "grep -q 'still receiving another push' /t/pushwait3.log && ! grep -q 'attempt 1 failed' /t/pushwait3.log && [ \"$(st "$A" push result)\" = OK ] && [ \"$(st "$A" push waited_for_peer_s)\" -gt 0 ]"
 sleep 61
-( exec 8>"$A/erp-backup/.push.lock"; flock 8; sleep 150 ) & HOLD=$!; sleep 2
+hold_lock "$A/erp-backup/.push.lock" 150
 PUSH_WAIT_POLL_S=5 run "$A" backup.sh > /t/backupwait.log 2>&1 || true
 wait $HOLD || true
 check "a backup during a push leaves the outgoing standby set alone until the push ends" grep -q "the other push has finished; going ahead (backup.sh" /t/backupwait.log
@@ -139,10 +141,10 @@ check "status.json carries the last activity for ERPNext" bash -c "run_r() { :; 
 run "$A" set-conf.sh PUSH_BWLIMIT_KBPS 0 >/dev/null
 
 echo "== installer waits (no --force) until the job ends"
-( exec 8>"$A/erp-backup/.push.lock"; flock 8; sleep 20 ) & HOLD=$!; sleep 1
+hold_lock "$A/erp-backup/.push.lock" 20
 ERP_KIT_HOSTNAME=boxa timeout 120 bash "$KIT" primary --root="$A" > /t/inst-wait.log 2>&1 && IW=ok || IW=fail
 wait $HOLD || true
-check "the installer waited, then installed" bash -c "grep -q 'waiting for running erp-backup jobs' /t/inst-wait.log && [ $IW = ok ] && grep -qx 2026-10-19.3 $A/erp-backup/KIT_VERSION"
+check "the installer waited, then installed" bash -c "grep -q 'waiting for running erp-backup jobs' /t/inst-wait.log && [ $IW = ok ] && grep -qx \"\$(sed -n 's/^KIT_VERSION=\\\"\\(.*\\)\\\"\$/\\1/p' $KIT)\" $A/erp-backup/KIT_VERSION"
 
 echo "== memory pre-check: MemAvailable, and swap only when active"
 printf 'MemAvailable: 3670016 kB\nSwapTotal: 4718592 kB\nSwapFree: 419430 kB\n' > /t/meminfo; printf 'pswpin 1000\n' > /t/vmstat; printf 'some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n' > /t/psi-idle; printf 'some avg10=35.00 avg60=20.00 avg300=5.00 total=9\n' > /t/psi-busy
@@ -209,8 +211,33 @@ echo "== the restore waits for a push the primary has announced but not finished
 ANNS=$(date -d '+3 days' +%F)_0232
 printf '{"schema":"erp-backup-inflight/1","box":"alpha","state":"sending","set":"%s","archive_bytes":1,"standby_set":"%s","standby_bytes":1,"started_at":"%s","updated_at":"%s"}\n' "$ANNS" "$ANNS" "$(date -Is)" "$(date -Is)" > "$B/erp-backup-from-alpha/receipts/inflight-alpha.json"
 STANDBY_WAIT_POLL_S=10 run "$B" standby-refresh.sh --now --force --wait-min=1 > /t/announce.log 2>&1 || true
-check "waited for the announced set before falling back" bash -c "grep -q 'announced' /t/announce.log && grep -qE 'standby already at|refreshed to|standby stays at' /t/announce.log"
+check "waited for the announced set before falling back" bash -c "grep -q 'announced' /t/announce.log && grep -qE 'standby already at|refreshed to|standby stays at|no-new-set:' /t/announce.log"
 rm -f "$B/erp-backup-from-alpha/receipts/inflight-alpha.json"
+
+echo "== every way a restore run ends leaves a status line (2026-10-19.4)"
+lastline() { tail -n1 "$1/erp-backup/status.log"; }
+run "$B" standby-refresh.sh --now --wait-min=0 > /t/r1.log 2>&1 || true
+check "nothing new: status line + standby_run outcome" bash -c "lastline() { tail -n1 \"\$1/erp-backup/status.log\"; }; lastline $B | grep -q 'standby no-new-set:' && grep -q '^outcome=no-new-set' $B/erp-backup/state/standby_run.env"
+sleep 61; run "$A" backup.sh >/dev/null; S5=$(st "$A" backup set); PUSH_RETRY_SLEEP=1 run "$A" push.sh receipts >/dev/null
+run "$B" standby-refresh.sh --now --wait-min=0 > /t/r2.log 2>&1 || true
+check "the peer has a newer backup that has not arrived: waiting-for-peer, naming it" bash -c "grep -q '^outcome=waiting-for-peer' $B/erp-backup/state/standby_run.env && grep -q '$S5' $B/erp-backup/state/standby_run.env"
+run "$B" report.sh
+check "STANDBY_WAITING_FOR_PEER raised" grep -q STANDBY_WAITING_FOR_PEER "$B/erp-backup/status.json"
+PUSH_RETRY_SLEEP=1 run "$A" push.sh >/dev/null
+bash -c ". $B/erp-backup/bin/common.sh; state_put standby_run at=\"\$(date -Is -d '-15 min')\" outcome=waiting-for-peer reason=test"
+rm -f /t/systemd/erp-standby-now.service; run "$B" tick.sh >/dev/null 2>&1 || true
+for _ in $(seq 1 90); do [ "$(st "$B" standby set)" = "$S5" ] && [ "$(st "$B" standby_run outcome)" = restored ] && break; sleep 4; done
+check "the 2-minute tick restored the late set by itself (catch-up)" bash -c "[ \"$(st "$B" standby set)\" = '$S5' ] && grep -q '^trigger=catch-up' $B/erp-backup/state/standby_run.env && grep -q 'catch-up restore of $S5' $B/erp-backup/status.log"
+run "$B" standby-refresh.sh --now --wait-min=0 > /t/r3.log 2>&1 || true
+check "a run with nothing new right after a restore: status line too (no-new-set: the restored set is now the delta basis)" bash -c "tail -n1 $B/erp-backup/status.log | grep -qE 'standby (already-current|no-new-set):'"
+echo "STANDBY_TIME=04:30" >> "$B/erp-backup/erp-backup.conf"
+ERP_KIT_HOSTNAME=boxb bash "$KIT" secondary --root="$B" --force > /dev/null 2>&1
+check "re-install retires the shadowed STANDBY_TIME key" bash -c "grep -q '^# STANDBY_TIME=04:30' $B/erp-backup/erp-backup.conf && ! grep -q '^STANDBY_TIME=' $B/erp-backup/erp-backup.conf"
+bash -c ". $B/erp-backup/bin/common.sh; sed -i 's/^every=.*/every=weekly/' $B/erp-backup/state/standby.env"; run "$B" report.sh
+check "standby_of_peer.every follows the conf, not the last run" python3 -c "import json; d=json.load(open('$B/erp-backup/status.json')); assert d['standby_of_peer']['every']=='daily' and d['standby_of_peer']['every_at_last_refresh']=='weekly'"
+bash -c ". $B/erp-backup/bin/common.sh; state_put archive_test result=OK at=\"\$(date -Is -d '-25 days')\" check=Pass"; run "$B" report.sh
+check "ARCHIVE_TEST_DUE_SOON a week before the 30-day limit" grep -q ARCHIVE_TEST_DUE_SOON "$B/erp-backup/status.json"
+rm -f "$B/erp-backup/state/archive_test.env"
 
 echo "== a set still arriving is waited for, not failed on"
 ARR=$(date -d '+2 days' +%F)_0232
@@ -260,6 +287,14 @@ check "one 'recovered' message" [ "$(grep -c recovered /t/notify.log)" = 1 ]
 run "$A" watchdog.sh >/dev/null
 check "no repeat while ok" [ "$(grep -c . /t/notify.log)" = 2 ]
 
+echo "== notifications switched on later still announce what is already wrong"
+run "$B" set-conf.sh NOTIFY_URL "" >/dev/null; rm -f "$B/erp-backup/state/notify.env"; : > /t/notify.log
+run "$B" set-conf.sh MAX_AGE_HOURS 0 >/dev/null; run "$B" watchdog.sh >/dev/null
+check "with NOTIFY_URL unset nothing is remembered as sent" bash -c "[ ! -f $B/erp-backup/state/notify.env ] && [ ! -s /t/notify.log ]"
+run "$B" set-conf.sh NOTIFY_URL http://127.0.0.1:18765/ > /t/setnotify.log 2>&1
+check "setting NOTIFY_URL sends a test, then the open problems" bash -c "grep -q 'test: erp-backup notifications are on' /t/notify.log && grep -qE '^\\[beta\\] (critical|warning) - ' /t/notify.log"
+run "$B" set-conf.sh MAX_AGE_HOURS 30 >/dev/null; run "$B" recv-check.sh >/dev/null 2>&1 || true
+
 echo "== peer status visible to the secondary's ERPNext"
 run "$B" set-conf.sh PEER_STATUS_TO_CONTAINER 1 >/dev/null; run "$B" report.sh
 check "alpha.json copied into the secondary's ERPNext" docker exec "$CONT_B" test -f /home/frappe/frappe-bench/sites/erp_backup_status/alpha.json
@@ -281,6 +316,7 @@ if [ -n "${STAGE_IMAGE:-}" ]; then
   echo "  $(grep '^STAGE' /t/stage.log | tail -n1)"
 fi
 
+check "no script anywhere hit an unexpected error" bash -c "! grep -h 'unexpected error at line' $A/erp-backup/status.log $B/erp-backup/status.log"
 echo
 echo "RESULT: $PASS passed, ${#FAILS[@]} failed"
 for f in "${FAILS[@]}"; do echo "  - $f"; done
