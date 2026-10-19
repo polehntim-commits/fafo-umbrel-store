@@ -79,6 +79,38 @@ check "peer got the complete encrypted set" test -f "$B/erp-backup-from-alpha/da
 check "peer got the complete standby set" test -f "$B/erp-backup-from-alpha/standby/$SET1/MANIFEST.sha256"
 check "peer got the primary's status" test -f "$B/erp-backup-from-alpha/receipts/status-alpha.json"
 
+echo "== one push at a time (2026-10-19.2)"
+( exec 8>"$A/erp-backup/.push.lock"; flock 8; sleep 25 ) & HOLD=$!; sleep 2
+PUSH_WAIT_POLL_S=5 PUSH_RETRY_SLEEP=999 timeout 300 bash -c "ERP_KIT_HOSTNAME=x bash $A/erp-backup/bin/push.sh" > /t/pushwait1.log 2>&1 || true
+wait $HOLD || true
+check "a second push waits for the one holding the lock" grep -q "another push holds" /t/pushwait1.log
+check "... then goes ahead and succeeds" bash -c "grep -q 'the other push has finished' /t/pushwait1.log && [ \"$(st "$A" push result)\" = OK ] && [ \"$(st "$A" push waited_for_other_push_s)\" -gt 0 ]"
+bash -c 'sleep 25; true' "$A/erp-backup/bin/push.sh" & OLD=$!; sleep 1     # an older kit's push: no lock, seen by its process
+PUSH_WAIT_POLL_S=5 PUSH_RETRY_SLEEP=999 timeout 300 bash -c "ERP_KIT_HOSTNAME=x bash $A/erp-backup/bin/push.sh" > /t/pushwait2.log 2>&1 || true
+wait $OLD || true
+check "a lock-less push of an older kit is recognised and waited for, with progress" grep -q "is in progress (nightly or manual: running" /t/pushwait2.log
+check "... then succeeds" [ "$(st "$A" push result)" = OK ]
+mkdir -p /t/shim; rm -f /t/shim/n
+cat > /t/shim/rsync <<'SHIM'
+#!/bin/bash
+n=$(( $(cat /t/shim/n 2>/dev/null || echo 0) + 1 )); echo $n > /t/shim/n
+if [ "$n" -le 2 ]; then echo "/usr/bin/rrsync error: Another instance of rrsync is already accessing this directory." >&2; echo "rsync error: error in rsync protocol data stream (code 12)" >&2; exit 12; fi
+exec /usr/bin/rsync "$@"
+SHIM
+chmod +x /t/shim/rsync
+PATH=/t/shim:$PATH PUSH_WAIT_POLL_S=2 PUSH_RETRY_SLEEP=999 timeout 300 bash -c "ERP_KIT_HOSTNAME=x bash $A/erp-backup/bin/push.sh" > /t/pushwait3.log 2>&1 || true
+check "the peer's rrsync lock is waited out, not counted as a failed attempt" bash -c "grep -q 'still receiving another push' /t/pushwait3.log && ! grep -q 'attempt 1 failed' /t/pushwait3.log && [ \"$(st "$A" push result)\" = OK ] && [ \"$(st "$A" push waited_for_peer_s)\" -gt 0 ]"
+sleep 61
+( exec 8>"$A/erp-backup/.push.lock"; flock 8; sleep 150 ) & HOLD=$!; sleep 2
+PUSH_WAIT_POLL_S=5 run "$A" backup.sh > /t/backupwait.log 2>&1 || true
+wait $HOLD || true
+check "a backup during a push leaves the outgoing standby set alone until the push ends" grep -q "the other push has finished; going ahead (backup.sh" /t/backupwait.log
+check "... and completes" [ "$(st "$A" backup result)" = OK ]
+BS=$(st "$A" backup set)
+PUSH_RETRY_SLEEP=1 run "$A" run-now.sh --push-only > /t/pushonly.log 2>&1 || true
+check "run-now --push-only sends without a new backup" bash -c "[ \"$(st "$A" backup set)\" = '$BS' ] && [ \"$(st "$A" push set)\" = '$BS' ] && ! grep -q '^== backup' /t/pushonly.log"
+check "the waiting standby set went with it" test -f "$B/erp-backup-from-alpha/standby/$BS/MANIFEST.sha256"
+
 echo "== secondary: first standby build"
 run "$B" standby-init.sh --force > /t/standby-init.log 2>&1 || { tail -n 20 /t/standby-init.log; bad "standby-init"; }
 check "standby site exists" docker exec "$CONT_B" test -f /home/frappe/frappe-bench/sites/standby-alpha/site_config.json

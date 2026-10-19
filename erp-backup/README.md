@@ -64,6 +64,29 @@ is skipped and reported:
 Before kit 2026-10-19.1, receivers took the newest folder by name. A push interrupted on 2026-10-17
 left a half-copied set there, and the next restore failed on it.
 
+## One push at a time
+
+A push can take hours over the tailnet; the nightly one is often still running in the early morning.
+
+- Every push holds `<root>/erp-backup/.push.lock`. Pushes from kits older than 2026-10-19.2 hold no lock,
+  so a running push is also recognised by its process: `push.sh`, or rsync to the peer.
+- A second push started meanwhile (`run-now.sh`, a manual `push.sh`) **waits** instead of failing:
+  - It says so at once and then every 5 minutes, with how long the other push has run and how much it
+    has read.
+  - It gives up after `PUSH_WAIT_MIN` (default 300).
+- The peer's rrsync refusing with "Another instance of rrsync is already accessing this directory" is
+  treated the same way: waited out, not counted as one of the three attempts.
+- `backup.sh` also waits before replacing the outgoing plaintext standby set, so it never deletes the set
+  a running push is sending. Kit 2026-10-19.1 did, once, on 2026-10-19.
+
+`push.sh` on its own is always safe to re-run:
+
+- it never deletes anything on the peer;
+- it re-sends whatever the peer is missing;
+- it keeps the outgoing standby set until a push of it succeeds.
+
+`run-now.sh --push-only` is the same, plus the summary.
+
 ## Status, alerts, notifications
 
 `report.sh` writes `status.json` (schema `erp-backup-status/1`, additive) and copies it into the ERPNext
@@ -114,7 +137,7 @@ changed. `oml` and `umbrellocal` remain accepted as role names for boxes install
 | Command | |
 |---|---|
 | `bin/status.sh` | Read-only report, safe to paste anywhere (no secrets). |
-| `bin/run-now.sh [--restore]` | Back up, push and copy to the second target now, and print a summary. `--restore` (secondary) also runs the restore test now. |
+| `bin/run-now.sh [--push-only] [--restore]` | Back up, push and copy to the second target now, and print a summary. Waits for a push already running. `--push-only` skips the backup and just sends what is waiting. `--restore` (secondary) also runs the restore test now. |
 | `bin/stage-upgrade.sh --image=IMAGE` | Secondary only. Restores a copy of the standby into a throwaway ERPNext built from IMAGE, runs `bench migrate`, checks it, then removes it. Use it before any image or framework upgrade. |
 | `bin/offsite.sh config` | Create the rclone remote for a second target (interactive). |
 | `bin/archive-test.sh peer\|own` | Encrypted-archive restore test (needs the private age key). |
@@ -126,6 +149,8 @@ changed. `oml` and `umbrellocal` remain accepted as role names for boxes install
 
 - backup and two-phase push;
 - the 2026-10-17 cut-off set, and a set still arriving;
+- one push at a time: a lock holder, an older kit's lock-less push, the peer's rrsync lock, a backup during
+  a push, `--push-only`;
 - first standby and nightly refresh with sanity checks;
 - receipts back to the primary;
 - second target;

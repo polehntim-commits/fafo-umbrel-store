@@ -13,7 +13,7 @@
 # (new keys are appended; change values with bin/set-conf.sh). Never edits app compose files or app-data, never
 # restarts the ERPNext containers, never writes secrets to disk. Hosts, names and paths live only in the conf.
 set -euo pipefail
-KIT_VERSION="2026-10-19.1"
+KIT_VERSION="2026-10-19.2"
 
 ROLE="${1:-}"; [ $# -gt 0 ] && shift
 ARG_ME=""; ARG_PEER=""; ARG_PEER_HOST=""; ARG_PRIMARY_HOSTNAME=""; ARG_CONTAINER=""
@@ -129,6 +129,7 @@ addconf NOTIFY_URL '""'
 addconf NOTIFY_REPEAT_HOURS 24
 addconf WATCHDOG_TIME "$WATCHDOG_TIME"
 addconf STANDBY_WAIT_MIN 150
+addconf PUSH_WAIT_MIN 300
 addconf PUSH_TRANSPORT ssh
 addconf PEER_LOCAL_DIR '""'
 addconf PEER_STATUS_TO_CONTAINER 0
@@ -187,6 +188,59 @@ incomplete_sets() { local d; for d in $(find "$1" -mindepth 1 -maxdepth 1 -type 
 dir_age_min() { echo $(( ( $(date +%s) - $(stat -c %Y "$1") ) / 60 )); }
 # Where pushes go. PUSH_TRANSPORT=ssh (default): the peer's write-only rrsync jail over the tailnet.
 # PUSH_TRANSPORT=local: a directory on this machine (PEER_LOCAL_DIR) - single-box installs, a USB disk, tests.
+# ---- one push at a time (2026-10-19.2) ------------------------------------------------------------------
+# A push to the peer can take hours over the tailnet. A second one started meanwhile (run-now.sh, a manual
+# push.sh) used to fail three times on the peer's "Another instance of rrsync is already accessing this
+# directory" and give up - and backup.sh replaced the plaintext standby set the running push was sending.
+# Now: every push holds $BASE/.push.lock; pushes from kits older than 2026-10-19.2 hold no lock, so a running
+# push is ALSO recognised by its process (push.sh, or rsync to the peer). Anything that would collide waits.
+PUSH_LOCK="$BASE/.push.lock"
+ppid_of() { awk '/^PPid:/{print $2}' "/proc/$1/status" 2>/dev/null; }
+# is_mine PID: this process, something it started, or something that started it (sudo bash push.sh, run-now.sh)
+is_mine() {
+  local p="$1" q="$$"
+  [ -d "/proc/$1" ] || return 0   # gone already (a short-lived subshell of this very lookup): not a push
+  while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null; do [ "$p" = "$$" ] && return 0; p=$(ppid_of "$p"); done
+  while [ -n "$q" ] && [ "$q" -ge 1 ] 2>/dev/null; do [ "$q" = "$1" ] && return 0; [ "$q" = 1 ] && break; q=$(ppid_of "$q"); done
+  return 1
+}
+other_push_pids() { # pids of a push to the peer that this process did not start
+  command -v pgrep >/dev/null 2>&1 || return 0
+  local p
+  { pgrep -f "$BASE/bin/push.sh" || true
+    pgrep -f "rsync .*@${PEER_HOST}:" || true
+    [ -n "${PEER_LOCAL_DIR:-}" ] && { pgrep -f "rsync .* ${PEER_LOCAL_DIR%/}" || true; }
+  } 2>/dev/null | sort -un | while read -r p; do if [ -n "$p" ] && ! is_mine "$p"; then echo "$p"; fi; done
+  return 0
+}
+push_progress() { # one line about the running push: since when, and how much rsync has read so far
+  local p el="" mb=0 b
+  for p in "$@"; do
+    [ -z "$el" ] && el=$(ps -o etime= -p "$p" 2>/dev/null | tr -d ' ')
+    b=$(awk '/^rchar:/{print $2}' "/proc/$p/io" 2>/dev/null || echo 0); mb=$(( mb + ${b:-0} / 1048576 ))
+  done
+  echo "running ${el:-?}, ${mb} MB read so far"
+}
+# wait_push_idle WHY : take the push lock, waiting (up to PUSH_WAIT_MIN) while any other push runs.
+# The lock is held on fd 8 until this script exits.
+wait_push_idle() {
+  local max=$(( ${PUSH_WAIT_MIN:-300} * 60 )) poll="${PUSH_WAIT_POLL_S:-60}" w=0 pids last=-1
+  exec 8>"$PUSH_LOCK"
+  while :; do
+    pids=$(other_push_pids | tr '\n' ' '); pids="${pids% }"
+    if [ -z "$pids" ] && flock -n 8; then
+      [ "$w" -gt 0 ] && log "the other push has finished; going ahead ($1) after $((w / 60)) min"
+      PUSH_WAITED=$w; export PUSH_WAITED; return 0
+    fi
+    [ "$w" -ge "$max" ] && die "a push to $PEER_NAME is still running after ${PUSH_WAIT_MIN:-300} min; not starting ($1). Run it again later."
+    if [ $(( w / 300 )) -ne "$last" ]; then   # say so at once, then every 5 minutes
+      last=$(( w / 300 ))
+      if [ -n "$pids" ]; then log "a push to $PEER_NAME is in progress (nightly or manual: $(push_progress $pids)), waiting... ($((w / 60)) of ${PUSH_WAIT_MIN:-300} min)"
+      else log "another push holds $PUSH_LOCK, waiting... ($((w / 60)) of ${PUSH_WAIT_MIN:-300} min)"; fi
+    fi
+    sleep "$poll"; w=$((w + poll))
+  done
+}
 peer_dest() { if [ "${PUSH_TRANSPORT:-ssh}" = local ]; then echo "${PEER_LOCAL_DIR%/}/${1:-}"; else echo "$PEER_USER@$PEER_HOST:./${1:-}"; fi; }
 origin_now() { if [ -f "$BASE/PROMOTED" ]; then sed -n 's/^ORIGIN=//p' "$BASE/PROMOTED"; else echo "$ME"; fi; }
 # run a command inside the ERPNext container as frappe, with selected env passed through (values never on argv)
@@ -573,7 +627,12 @@ STAGE=backup
 . "$(dirname "$0")/lib-site.sh"
 need_root
 trap 'die "unexpected error at line $LINENO"' ERR
-exec 9>"$BASE/.lock"; flock -n 9 || die "another backup is already running"
+exec 9>"$BASE/.lock"
+if ! flock -n 9; then
+  [ "${BACKUP_LOCK_WAIT_S:-0}" -gt 0 ] || die "another backup is already running"
+  log "another backup is running, waiting up to $(( BACKUP_LOCK_WAIT_S / 60 )) min..."
+  flock -w "$BACKUP_LOCK_WAIT_S" 9 || die "another backup is still running after $(( BACKUP_LOCK_WAIT_S / 60 )) min"
+fi
 [ -n "$ARCHIVE_RECIPIENT" ] || die "ARCHIVE_RECIPIENT not set (run set-recipient.sh); refusing to write unencrypted archives"
 [ -x "$AGE" ] || die "age not installed (run get-age.sh)"
 
@@ -624,6 +683,8 @@ mv "$ARCH.partial" "$ARCH"
 
 # plaintext standby set for the peer (pushed, then deleted); otherwise drop the plaintext now
 if [ "$SEND_ENABLED" = 1 ] && { [ "$SEND_STANDBY_SET" = 1 ] || [ -f "$BASE/PROMOTED" ]; }; then
+  # the set in work/standby may be the one a running push is sending right now: wait for it to finish
+  wait_push_idle "backup.sh replacing the outgoing standby set"
   find "$BASE/work/standby" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
   mv "$WORK" "$BASE/work/standby/$STAMP"
 else
@@ -678,9 +739,26 @@ else
   [ -f "$SSH_KEY" ] && [ -s "$KNOWN_HOSTS" ] || die "send key or known_hosts missing; run setup-send.sh"
   init_ssh; RSYNC_E=(-e "$RSYNC_RSH")
 fi
-T0=$SECONDS; ATTEMPTS=0
-try3() { local t; for t in 1 2 3; do ATTEMPTS=$((ATTEMPTS + 1)); "$@" && return 0; [ "$t" -lt 3 ] && { log "attempt $t failed, retrying"; sleep "${PUSH_RETRY_SLEEP:-300}"; }; done; return 1; }
-up() { rsync -aH --partial --timeout=600 --exclude '*.partial' "${RSYNC_E[@]}" "$@"; }
+wait_push_idle "push.sh $MODE"
+T0=$SECONDS; ATTEMPTS=0; BUSY_WAIT=0
+ERRF=$(mktemp); trap 'rm -f "$ERRF"' EXIT
+up() { local rc=0; rsync -aH --partial --timeout=600 --exclude '*.partial' "${RSYNC_E[@]}" "$@" 2>"$ERRF" || rc=$?; cat "$ERRF" >&2; return $rc; }
+# try_up ARGS... : up to 3 real attempts. The peer's rrsync refusing because another push is still writing
+# there (e.g. one started by an older kit that holds no lock) is NOT a failed attempt: wait and try again.
+try_up() {
+  local t=1 poll="${PUSH_WAIT_POLL_S:-60}" max=$(( ${PUSH_WAIT_MIN:-300} * 60 ))
+  while :; do
+    ATTEMPTS=$((ATTEMPTS + 1))
+    up "$@" && return 0
+    if grep -q "Another instance of rrsync is already accessing" "$ERRF"; then
+      [ "$BUSY_WAIT" -ge "$max" ] && { log "$PEER_NAME still busy with another push after ${PUSH_WAIT_MIN:-300} min"; return 1; }
+      [ $(( BUSY_WAIT % 300 )) -lt "$poll" ] && log "$PEER_NAME is still receiving another push (its rrsync lock), waiting... ($((BUSY_WAIT / 60)) of ${PUSH_WAIT_MIN:-300} min)"
+      sleep "$poll"; BUSY_WAIT=$((BUSY_WAIT + poll)); continue
+    fi
+    [ "$t" -ge 3 ] && return 1
+    log "attempt $t failed, retrying"; sleep "${PUSH_RETRY_SLEEP:-300}"; t=$((t + 1))
+  done
+}
 share_status() { # this box's status rides along with the receipts, so the peer's ERPNext can watch us too
   bash "$(dirname "$0")/report.sh" >/dev/null 2>&1 || true
   [ -f "$BASE/status.json" ] && cp "$BASE/status.json" "$BASE/own/receipts/status-$ME.json" 2>/dev/null || true
@@ -688,24 +766,25 @@ share_status() { # this box's status rides along with the receipts, so the peer'
 mkdir -p "$BASE/own/receipts" "$BASE/own/monthly"
 if [ "$MODE" = receipts ]; then
   share_status
-  try3 up "$BASE/own/receipts" "$(peer_dest)" || die "receipt push to $PEER_NAME failed"
+  try_up "$BASE/own/receipts" "$(peer_dest)" || die "receipt push to $PEER_NAME failed"
   log "OK receipts pushed"; exit 0
 fi
 share_status
 SRC=("$BASE/own/daily" "$BASE/own/weekly" "$BASE/own/monthly" "$BASE/own/receipts")
-try3 up --exclude SHA256SUMS "${SRC[@]}" "$(peer_dest)" || die "archive push to $PEER_NAME ($PEER_HOST) failed 3 times ($(link_desc))"
-try3 up "${SRC[@]}" "$(peer_dest)" || die "archive push to $PEER_NAME: the completion markers did not go (sets stay incomplete there)"
+try_up --exclude SHA256SUMS "${SRC[@]}" "$(peer_dest)" || die "archive push to $PEER_NAME ($PEER_HOST) failed 3 times ($(link_desc))"
+try_up "${SRC[@]}" "$(peer_dest)" || die "archive push to $PEER_NAME: the completion markers did not go (sets stay incomplete there)"
 SB=$(newest_dir "$BASE/work/standby"); SBS=no
 if [ -n "$SB" ]; then
-  try3 up --exclude MANIFEST.sha256 "$SB" "$(peer_dest standby/)" || die "standby-set push to $PEER_NAME failed"
-  try3 up "$SB" "$(peer_dest standby/)" || die "standby-set push to $PEER_NAME: MANIFEST did not go (set stays incomplete there)"
+  try_up --exclude MANIFEST.sha256 "$SB" "$(peer_dest standby/)" || die "standby-set push to $PEER_NAME failed"
+  try_up "$SB" "$(peer_dest standby/)" || die "standby-set push to $PEER_NAME: MANIFEST did not go (set stays incomplete there)"
   rm -rf "$SB"; SBS=yes
 fi
 N=$(basename "$(newest_dir "$BASE/own/daily")")
 DUR=$((SECONDS - T0))
 log "OK pushed through $N to $PEER_NAME in ${DUR}s, $ATTEMPTS rsync call(s) (standby set sent: $SBS)"
 status "OK push $N -> $PEER_NAME standby=$SBS ${DUR}s attempts=$ATTEMPTS"
-state_put push result=OK at="$(date -Is)" set="$N" peer="$PEER_NAME" standby_set_sent="$SBS" duration_s="$DUR" attempts="$ATTEMPTS" transport="${PUSH_TRANSPORT:-ssh}"
+state_put push result=OK at="$(date -Is)" set="$N" peer="$PEER_NAME" standby_set_sent="$SBS" duration_s="$DUR" attempts="$ATTEMPTS" transport="${PUSH_TRANSPORT:-ssh}" \
+  waited_for_other_push_s="${PUSH_WAITED:-0}" waited_for_peer_s="$BUSY_WAIT"
 report_quiet
 EOF_PUSH
 
@@ -1334,18 +1413,22 @@ EOF_WATCH
 cat > "$BASE/bin/run-now.sh" <<'EOF_RUNNOW'
 #!/bin/bash
 # Back up NOW, push to the peer, copy to the second target (if any), and print where things stand.
-# On the standby box, --restore also loads the newest complete set into the standby and checks it.
+#   --push-only   skip the backup: just send what is waiting (e.g. after a push that failed or was refused)
+#   --restore     (standby box) also load the newest complete set into the standby and check it
+# A push already running (the nightly one takes hours) is waited for, with progress every 5 minutes, not
+# fought with. push.sh on its own does the same and is always safe to re-run: it never deletes on the peer,
+# re-sends whatever the peer is missing, and sends the waiting standby set until one push of it succeeds.
 set -euo pipefail
 STAGE=run-now
 . "$(dirname "$0")/common.sh"
 need_root
-B="$(dirname "$0")"; RESTORE=0
-for a in "$@"; do case "$a" in --restore) RESTORE=1;; *) echo "Usage: sudo bash $0 [--restore]"; exit 1;; esac; done
+B="$(dirname "$0")"; RESTORE=0; PUSHONLY=0
+for a in "$@"; do case "$a" in --restore) RESTORE=1;; --push-only) PUSHONLY=1;; *) echo "Usage: sudo bash $0 [--push-only] [--restore]"; exit 1;; esac; done
 if [ "$SEND_ENABLED" = 1 ]; then
-  echo "== backup"; bash "$B/backup.sh"
-  echo "== push to $PEER_NAME"; PUSH_RETRY_SLEEP="${PUSH_RETRY_SLEEP:-60}" bash "$B/push.sh"
+  if [ "$PUSHONLY" = 0 ]; then echo "== backup"; BACKUP_LOCK_WAIT_S="${BACKUP_LOCK_WAIT_S:-3600}" bash "$B/backup.sh"; fi
+  echo "== push to $PEER_NAME (waits for a push already in progress)"; PUSH_RETRY_SLEEP="${PUSH_RETRY_SLEEP:-60}" bash "$B/push.sh"
 fi
-[ "${TARGET2_KIND:-none}" != none ] && { echo "== second target"; bash "$B/offsite.sh"; }
+[ "${TARGET2_KIND:-none}" != none ] && [ "$PUSHONLY" = 0 ] && { echo "== second target"; bash "$B/offsite.sh"; }
 [ "$RESTORE" = 1 ] && { echo "== restore test"; STANDBY_WAIT_MIN=0 bash "$B/standby-refresh.sh" --now; }
 bash "$B/report.sh" >/dev/null 2>&1 || true
 python3 - "$BASE/status.json" <<'PY'
@@ -1702,6 +1785,7 @@ docker ps --format '{{.Names}}  {{.Status}}' 2>/dev/null | grep -i erpnext || ec
 docker exec "$CONTAINER" sh -c "ls -1 '$BENCH/sites' | grep -v -e '\.json$' -e '^assets$'" 2>/dev/null | sed 's/^/  site dir: /'
 echo "--- timers"
 systemctl list-timers 'erp-*' --all --no-pager 2>/dev/null || true
+PP=$(other_push_pids | tr '\n' ' '); [ -n "${PP// /}" ] && echo "PUSH IN PROGRESS to $PEER_NAME: $(push_progress $PP)" || echo "no push in progress"
 for u in erp-backup erp-standby erp-recv-check erp-offsite erp-scrub erp-watchdog; do echo "$u.service: $(systemctl show -p Result --value "$u.service" 2>/dev/null || echo n/a)"; done
 echo "--- last 15 status lines"
 tail -n 15 "$STATUS" 2>/dev/null || echo "(no status.log yet)"
