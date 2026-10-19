@@ -19,7 +19,7 @@
 # (new keys are appended; change values with bin/set-conf.sh). Never edits app compose files or app-data, never
 # restarts the ERPNext containers, never writes secrets to disk. Hosts, names and paths live only in the conf.
 set -euo pipefail
-KIT_VERSION="2026-10-19.4"
+KIT_VERSION="2026-10-19.5"
 
 ROLE="${1:-}"; [ $# -gt 0 ] && shift
 ARG_ME=""; ARG_PEER=""; ARG_PEER_HOST=""; ARG_PRIMARY_HOSTNAME=""; ARG_CONTAINER=""; FORCE_INSTALL=0; NO_WAIT=0
@@ -1670,6 +1670,8 @@ cat > "$NB/run-now.sh" <<'EOF_RUNNOW'
 # Back up NOW, push to the peer, copy to the second target (if any), and print where things stand.
 #   --push-only   skip the backup: just send what is waiting (e.g. after a push that failed or was refused)
 #   --restore     (standby box) also load the newest complete set into the standby and check it
+#   --restore-only (standby box) ONLY the restore test: no backup, no push, no second-target copy of this box's
+#                 own data - the quick check before an upgrade. Fails fast on a box without a standby.
 # A push already running (the nightly one takes hours) is waited for, with progress every 5 minutes, not
 # fought with. push.sh on its own does the same and is always safe to re-run: it never deletes on the peer,
 # re-sends whatever the peer is missing, and sends the waiting standby set until one push of it succeeds.
@@ -1677,13 +1679,16 @@ set -euo pipefail
 STAGE=run-now
 . "$(dirname "$0")/common.sh"
 need_root
-B="$(dirname "$0")"; RESTORE=0; PUSHONLY=0
-for a in "$@"; do case "$a" in --restore) RESTORE=1;; --push-only) PUSHONLY=1;; *) echo "Usage: sudo bash $0 [--push-only] [--restore]"; exit 1;; esac; done
-if [ "$SEND_ENABLED" = 1 ]; then
+B="$(dirname "$0")"; RESTORE=0; PUSHONLY=0; RONLY=0
+for a in "$@"; do case "$a" in --restore) RESTORE=1;; --restore-only) RESTORE=1; RONLY=1;; --push-only) PUSHONLY=1;;
+  *) echo "Usage: sudo bash $0 [--push-only] [--restore | --restore-only]"; exit 1;; esac; done
+[ "$RONLY" = 1 ] && [ "$PUSHONLY" = 1 ] && { echo "--restore-only and --push-only exclude each other"; exit 1; }
+if [ "$RONLY" = 1 ] && [ "$STANDBY_ENABLED" != 1 ]; then echo "--restore-only: this box holds no standby (STANDBY_ENABLED=0); run it on the standby box"; exit 1; fi
+if [ "$SEND_ENABLED" = 1 ] && [ "$RONLY" = 0 ]; then
   if [ "$PUSHONLY" = 0 ]; then echo "== backup"; BACKUP_LOCK_WAIT_S="${BACKUP_LOCK_WAIT_S:-3600}" bash "$B/backup.sh"; fi
   echo "== push to $PEER_NAME (waits for a push already in progress)"; PUSH_RETRY_SLEEP="${PUSH_RETRY_SLEEP:-60}" bash "$B/push.sh"
 fi
-[ "${TARGET2_KIND:-none}" != none ] && [ "$PUSHONLY" = 0 ] && { echo "== second target"; bash "$B/offsite.sh"; }
+[ "${TARGET2_KIND:-none}" != none ] && [ "$PUSHONLY" = 0 ] && [ "$RONLY" = 0 ] && { echo "== second target"; bash "$B/offsite.sh"; }
 [ "$RESTORE" = 1 ] && { echo "== restore test"; bash "$B/standby-refresh.sh" --now --wait-min=0 --trigger=run-now; }
 bash "$B/report.sh" >/dev/null 2>&1 || true
 python3 - "$BASE/status.json" <<'PY'

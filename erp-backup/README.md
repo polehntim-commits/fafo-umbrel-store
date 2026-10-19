@@ -228,7 +228,7 @@ changed. `oml` and `umbrellocal` remain accepted as role names for boxes install
 | `bin/status.sh` | Read-only report, safe to paste anywhere (no secrets). |
 | `bin/progress.sh [--watch [N]] [--json]` | Live progress of the running backup / push / restore and of sets arriving from the peer. |
 | `bin/link-test.sh` | Path to the peer: reachable, host key pinned, key jailed, and direct vs DERP relay, plus the last push's rate. |
-| `bin/run-now.sh [--push-only] [--restore]` | Back up, push and copy to the second target now, and print a summary. Waits for a push already running. `--push-only` skips the backup and just sends what is waiting. `--restore` (secondary) also runs the restore test now. |
+| `bin/run-now.sh [--push-only] [--restore]` | Back up, push and copy to the second target now, and print a summary. Waits for a push already running. `--push-only` skips the backup and just sends what is waiting. `--restore` (secondary) also runs the restore test now. `--restore-only` runs just the restore test, with no backup or push of the secondary's own data (the quick pre-upgrade check). |
 | `bin/stage-upgrade.sh --image=IMAGE` | Secondary only. Restores a copy of the standby into a throwaway ERPNext built from IMAGE, runs `bench migrate`, checks it, then removes it. Use it before any image or framework upgrade. |
 | `bin/offsite.sh config` | Create the rclone remote for a second target (interactive). |
 | `bin/archive-test.sh peer\|own` | Encrypted-archive restore test (needs the private age key). |

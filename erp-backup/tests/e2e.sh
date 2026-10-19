@@ -304,6 +304,10 @@ sleep 61
 PUSH_RETRY_SLEEP=1 run "$A" run-now.sh > /t/run-now.log 2>&1 || { tail /t/run-now.log; bad "run-now"; }
 check "run-now made a new set and pushed it" [ "$(st "$A" push set)" = "$(st "$A" backup set)" ]
 check "run-now printed a summary" grep -q '^== alpha: overall' /t/run-now.log
+BB=$(st "$B" backup set); BP=$(st "$B" push at)
+run "$B" run-now.sh --restore-only > /t/restore-only.log 2>&1 || { tail /t/restore-only.log; bad "run-now --restore-only"; }
+check "run-now --restore-only: restore test only, no backup or push of the standby box's own data" bash -c "grep -q '^== restore test' /t/restore-only.log && ! grep -qE '^== (backup|push)' /t/restore-only.log && [ \"$(st "$B" backup set)\" = '$BB' ] && [ \"$(st "$B" push at)\" = '$BP' ] && grep -q '^trigger=run-now' $B/erp-backup/state/standby_run.env"
+check "--restore-only refuses on a box without a standby" bash -c "! ERP_KIT_HOSTNAME=x bash $A/erp-backup/bin/run-now.sh --restore-only >/dev/null 2>&1"
 
 if [ -n "${STAGE_IMAGE:-}" ]; then
   echo "== staged upgrade on a copy ($STAGE_IMAGE)"
