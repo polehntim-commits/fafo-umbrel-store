@@ -121,6 +121,29 @@ A push can take hours over the tailnet; the nightly one is often still running i
 
 `run-now.sh --push-only` is the same, plus the summary.
 
+## What a push's numbers mean, and when it fails
+
+From 2026-10-24.1 each push records, in `status.log` and `state/push.env`:
+
+- `attempts`: the most tries any one step needed. **1 means every step went through first time.**
+- `retries`: failed tries in all. `calls`: rsync runs in all (6 for a healthy push with a standby set).
+- `path`: how packets reached the peer tonight, from the Tailscale container: `direct` or `derp` (relay, about 1 Mbit/s).
+
+Kits up to 2026-10-19.5 wrote the rsync **call** count as `attempts=`. A healthy push logged `attempts=4` in kit .1/.2
+and `attempts=6` in .3-.5, which read as "failed three times". It wasn't: none of those calls had failed.
+
+Every failed try leaves a line with its reason, in the journal and in `status.log`:
+
+    WARN push 2026-10-24_0232 try 1/3 failed (encrypted archives (1/4)): rc=255 ssh failed (no connection, refused or dropped) - Timeout, server 100.64.0.9 not responding.
+
+- A step gets 3 tries. The first retry comes after 60 s, the second after `PUSH_RETRY_SLEEP` (300 s).
+- The peer's rrsync lock ("another push is still writing") is waited out and is not a try.
+- When a step runs out of tries, the push ends `FAIL` with the last reason and `PUSH_STALE_OR_FAILED` is raised.
+- So does a push stopped by systemd (time limit) or by hand, and any other unexpected exit. Earlier kits left the
+  previous `OK` in place then, and the alert only came 30 h later as "stale".
+- `erp-backup.service` (backup + push) and `erp-push.service` may run 12 h. Other units keep 4 h. A push can wait
+  up to `PUSH_WAIT_MIN` (5 h) for another one, so 4 h could cut a slow push off.
+
 ## Watching a backup as it runs
 
 `sudo bash bin/progress.sh --watch` (default refresh 10 s; `--json` for machines). It shows:
@@ -250,5 +273,10 @@ changed. `oml` and `umbrellocal` remain accepted as role names for boxes install
 - notification dedupe and recovery;
 - peer status in ERPNext;
 - `run-now`, and optionally `stage-upgrade`.
+
+`tests/push-retry.sh` needs no ERPNext. It pushes a fake set through the real rrsync jail and checks the push
+counters, a logged reason for each failed try, `FAIL` plus `PUSH_STALE_OR_FAILED` when the peer stays unreachable,
+a push stopped by a signal, and the 12 h unit limit. Run it with
+`docker run --rm -v "$PWD":/kit:ro erp-backup-harness:test bash /kit/tests/push-retry.sh` from `erp-backup/`.
 
 It runs inside `tests/Dockerfile` with the docker socket mounted; see the header of `e2e.sh`.

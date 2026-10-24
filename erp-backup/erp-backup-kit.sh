@@ -19,7 +19,7 @@
 # (new keys are appended; change values with bin/set-conf.sh). Never edits app compose files or app-data, never
 # restarts the ERPNext containers, never writes secrets to disk. Hosts, names and paths live only in the conf.
 set -euo pipefail
-KIT_VERSION="2026-10-19.5"
+KIT_VERSION="2026-10-24.1"
 
 ROLE="${1:-}"; [ $# -gt 0 ] && shift
 ARG_ME=""; ARG_PEER=""; ARG_PEER_HOST=""; ARG_PRIMARY_HOSTNAME=""; ARG_CONTAINER=""; FORCE_INSTALL=0; NO_WAIT=0
@@ -241,7 +241,7 @@ PY
   fi
   return 0
 }
-die()    { log "FAIL: $*"; status "FAIL $STAGE $*"; notify "FAIL $STAGE $*"; state_fail "$STAGE" "$*"; prog end FAIL "$*"
+die()    { _DIED=1; log "FAIL: $*"; status "FAIL $STAGE $*"; notify "FAIL $STAGE $*"; state_fail "$STAGE" "$*"; prog end FAIL "$*"
            [ "$STAGE" = standby ] && state_put standby_run at="$(date -Is)" outcome=failed reason="$*" trigger="${ERPB_TRIGGER:-timer}"
            report_quiet; exit 1; }
 # live progress (progress.py): prog begin PHASE STEP SET [--total BYTES] [--expect SECONDS] | prog bytes N [TOTAL] | prog end RESULT [NOTE]
@@ -910,12 +910,22 @@ else
   [ -f "$SSH_KEY" ] && [ -s "$KNOWN_HOSTS" ] || die "send key or known_hosts missing; run setup-send.sh"
   init_ssh; RSYNC_E=(-e "$RSYNC_RSH")
 fi
+PSET=""; PSTEP="start"
+ERRF=$(mktemp)
+# Every way push.sh ends without success leaves result=FAIL in state/push.env, so PUSH_STALE_OR_FAILED is raised at
+# once: die() itself, a systemd stop or timeout (SIGTERM; kits before 2026-10-24.1 left the last OK in place), and any
+# unexpected exit. die() sets _DIED, so a failure is never recorded twice.
+on_exit() { local rc=$?; rm -f "$ERRF"; trap - EXIT; [ "$rc" = 0 ] || [ "${_DIED:-0}" = 1 ] || die "push.sh ended unexpectedly (exit $rc) during: ${PSTEP:-start}"; }
+trap on_exit EXIT
+trap 'die "push.sh was stopped by a signal during: ${PSTEP:-start} (systemd timeout or a manual stop)${LAST_FAIL:+; last failed attempt: $LAST_FAIL}"' TERM INT HUP
 wait_push_idle "push.sh $MODE"
-T0=$SECONDS; ATTEMPTS=0; BUSY_WAIT=0
-ERRF=$(mktemp); trap 'rm -f "$ERRF"' EXIT
+# Counters (2026-10-24.1). Kits up to 2026-10-19.5 logged "attempts=" as the number of rsync CALLS: 4 on a healthy
+# push in kit .1/.2, 6 in .3-.5. It read as "three failures, then success" but meant none failed.
+#   attempts = most tries any one step needed (1 = every step went through first time)
+#   retries  = failed tries in all (each logged with its reason)    calls = rsync runs in all
+T0=$SECONDS; CALLS=0; RETRIES=0; MAXTRY=0; BUSY_WAIT=0; LAST_FAIL=""
 STATSF="$STATE/push-stats.json"; rm -f "$STATSF"
 BW=(); [ "${PUSH_BWLIMIT_KBPS:-0}" -gt 0 ] && BW=(--bwlimit="$PUSH_BWLIMIT_KBPS")
-PSET=""; PSTEP=""
 # up ARGS... : one rsync. --info=progress2/--stats are client-side only (the peer's rrsync never sees them); the
 # output feeds progress.py, which keeps state/progress.json current and adds the byte counts to push-stats.json.
 up() {
@@ -927,22 +937,51 @@ up() {
   rc=${PIPESTATUS[0]}; set -e
   cat "$ERRF" >&2; return "$rc"
 }
-# try_up ARGS... : up to 3 real attempts. The peer's rrsync refusing because another push is still writing
-# there (e.g. one started by an older kit that holds no lock) is NOT a failed attempt: wait and try again.
+# fail_reason RC : one line on why an rsync call failed - rsync's exit code in words plus what ssh / rsync / rrsync
+# printed (stderr of that call; it never holds secrets). Goes to the journal, status.log and state/push.env.
+fail_reason() {
+  local rc="$1" what msg
+  case "$rc" in
+    5) what="rsync could not start on the peer";;
+    10) what="socket I/O error";;
+    11) what="file I/O error";;
+    12) what="data stream broken (connection dropped)";;
+    20) what="stopped by a signal";;
+    23) what="partial transfer (some files failed)";;
+    24) what="source files vanished";;
+    30) what="rsync timeout: no data for 600 s";;
+    35) what="timeout waiting for the peer";;
+    255) what="ssh failed (no connection, refused or dropped)";;
+    *) what="rsync exit $rc";;
+  esac
+  # the specific lines first (ssh's own message, rrsync's refusal); rsync's generic "rsync error: ... (code N)" last
+  msg=$( { grep -v -e '^rsync error:' -e '^[[:space:]]*$' "$ERRF" | tail -n 2; grep -m1 '^rsync error:' "$ERRF"; } 2>/dev/null \
+         | tr -d '\r' | tr '\n' ' ' | tr -s ' ' | cut -c1-240)
+  echo "rc=$rc $what${msg:+ - $msg}"
+}
+# try_up ARGS... : up to 3 tries of one step. The peer's rrsync refusing because another push is still writing
+# there (e.g. one started by an older kit that holds no lock) is NOT a failed try: wait and try again.
+# Each failed try is logged with its reason. The retry waits 60 s, then PUSH_RETRY_SLEEP (300 s).
 try_up() {
-  local t=1 poll="${PUSH_WAIT_POLL_S:-60}" max=$(( ${PUSH_WAIT_MIN:-300} * 60 ))
+  local t=1 rc poll="${PUSH_WAIT_POLL_S:-60}" max=$(( ${PUSH_WAIT_MIN:-300} * 60 )) why pause
   while :; do
-    ATTEMPTS=$((ATTEMPTS + 1))
-    up "$@" && return 0
+    CALLS=$((CALLS + 1)); rc=0
+    up "$@" || rc=$?
+    if [ "$rc" = 0 ]; then [ "$t" -gt "$MAXTRY" ] && MAXTRY=$t; return 0; fi
     if grep -q "Another instance of rrsync is already accessing" "$ERRF"; then
-      [ "$BUSY_WAIT" -ge "$max" ] && { log "$PEER_NAME still busy with another push after ${PUSH_WAIT_MIN:-300} min"; return 1; }
+      [ "$BUSY_WAIT" -ge "$max" ] && { LAST_FAIL="$PSTEP: $PEER_NAME still busy with another push after ${PUSH_WAIT_MIN:-300} min"; log "$LAST_FAIL"; return 1; }
       [ $(( BUSY_WAIT % 300 )) -lt "$poll" ] && log "$PEER_NAME is still receiving another push (its rrsync lock), waiting... ($((BUSY_WAIT / 60)) of ${PUSH_WAIT_MIN:-300} min)"
       sleep "$poll"; BUSY_WAIT=$((BUSY_WAIT + poll)); continue
     fi
+    why=$(fail_reason "$rc"); RETRIES=$((RETRIES + 1)); [ "$t" -gt "$MAXTRY" ] && MAXTRY=$t
+    LAST_FAIL="$PSTEP, try $t/3: $why"
     # the peer's rrsync refusing an option or a path is permanent: retrying cannot change it
-    if grep -q "rrsync error:" "$ERRF"; then log "$PEER_NAME's rrsync refused this transfer: $(grep -m1 'rrsync error:' "$ERRF" | cut -c1-200)"; return 1; fi
-    [ "$t" -ge 3 ] && return 1
-    log "attempt $t failed, retrying"; sleep "${PUSH_RETRY_SLEEP:-300}"; t=$((t + 1))
+    if grep -q "rrsync error:" "$ERRF"; then log "$PEER_NAME's rrsync refused this transfer ($PSTEP): $why"; status "WARN push $PSET refused by $PEER_NAME's rrsync ($PSTEP): $why"; return 1; fi
+    if [ "$t" -ge 3 ]; then log "try $t/3 of $PSTEP failed: $why - giving up"; status "WARN push $PSET try $t/3 failed ($PSTEP): $why"; return 1; fi
+    pause="${PUSH_RETRY_SLEEP:-300}"; [ "$t" = 1 ] && [ "$pause" -gt 60 ] && pause=60
+    log "try $t/3 of $PSTEP failed: $why - trying again in ${pause}s"
+    status "WARN push $PSET try $t/3 failed ($PSTEP): $why"
+    sleep "$pause"; t=$((t + 1))
   done
 }
 share_status() { # this box's status rides along with the receipts, so the peer's ERPNext can watch us too
@@ -953,7 +992,7 @@ mkdir -p "$BASE/own/receipts" "$BASE/own/monthly"
 if [ "$MODE" = receipts ]; then
   share_status
   PSET=receipts; PSTEP="receipts"; PTOTAL=0
-  try_up "$BASE/own/receipts" "$(peer_dest)" || die "receipt push to $PEER_NAME failed"
+  try_up "$BASE/own/receipts" "$(peer_dest)" || die "receipt push to $PEER_NAME failed: $LAST_FAIL"
   prog end OK receipts; log "OK receipts pushed"; exit 0
 fi
 share_status
@@ -963,13 +1002,22 @@ NEWB=$(bytes_of "$BASE/own/daily/$N"); SBB=0; [ -n "$SB" ] && SBB=$(bytes_of "$S
 inflight() { printf '{"schema":"erp-backup-inflight/1","box":"%s","state":"%s","set":"%s","archive_bytes":%s,"standby_set":"%s","standby_bytes":%s,"started_at":"%s","updated_at":"%s"}\n' \
   "$ME" "$1" "$N" "$NEWB" "$(basename "${SB:-none}")" "$SBB" "$PSTART" "$(date -Is)" > "$BASE/own/receipts/inflight-$ME.json"; }
 PSTART=$(date -Is); inflight sending
+# how packets reach the peer tonight (read-only: tailscale status + 3 pings in the Tailscale container, a few seconds).
+# A slow push then says why: path=derp is Tailscale's relay (about 1 Mbit/s), path=direct is not.
+LPATH=""
+if [ "${PUSH_TRANSPORT:-ssh}" = ssh ] && [ -z "${ERP_KIT_TEST_RSH:-}" ]; then
+  LP=$(link_probe 2>/dev/null || true); LPATH=$(sed -n 's/^path=//p' <<<"$LP"); LPATH="${LPATH:-unknown}"
+  # shellcheck disable=SC2046
+  state_put link at="$(date -Is)" $(tr '\n' ' ' <<<"$LP") last_push_rate_kbps="$(state_get push rate_kbps)"
+  log "path to $PEER_NAME: $(tr '\n' ' ' <<<"$LP")"
+fi
 PSTEP="notice to $PEER_NAME (0/4)"; PTOTAL=0
-try_up "$BASE/own/receipts" "$(peer_dest)" || die "push to $PEER_NAME ($PEER_HOST) failed 3 times ($(link_desc))"
+try_up "$BASE/own/receipts" "$(peer_dest)" || die "push to $PEER_NAME ($PEER_HOST) failed ($(link_desc)${LPATH:+ path=$LPATH}): $LAST_FAIL"
 SRC=("$BASE/own/daily" "$BASE/own/weekly" "$BASE/own/monthly" "$BASE/own/receipts")
 PSTEP="encrypted archives (1/4)"; PTOTAL="$NEWB"
-try_up --exclude SHA256SUMS "${SRC[@]}" "$(peer_dest)" || die "archive push to $PEER_NAME ($PEER_HOST) failed 3 times ($(link_desc))"
+try_up --exclude SHA256SUMS "${SRC[@]}" "$(peer_dest)" || die "archive push to $PEER_NAME ($PEER_HOST) failed ($(link_desc)${LPATH:+ path=$LPATH}): $LAST_FAIL"
 PSTEP="archive completion markers (2/4)"; PTOTAL=0
-try_up "${SRC[@]}" "$(peer_dest)" || die "archive push to $PEER_NAME: the completion markers did not go (sets stay incomplete there)"
+try_up "${SRC[@]}" "$(peer_dest)" || die "archive push to $PEER_NAME: the completion markers did not go (sets stay incomplete there): $LAST_FAIL"
 if [ -n "$SB" ]; then
   SN="$(basename "$SB")"; PSTEP="plaintext standby set $SN (3/4)"; PTOTAL="$SBB"
   # DELTA_STANDBY=1: the peer keeps the set it last restored as standby/.basis; rsync matches today's files against
@@ -986,11 +1034,11 @@ if [ -n "$SB" ]; then
   fi
   if [ "$DELTAOK" = 1 ]; then
     PSTEP="standby manifest (4/4)"; PTOTAL=0
-    try_up --mkpath "$SB/" "$(peer_dest "standby/$SN/")" || die "standby-set push to $PEER_NAME: MANIFEST did not go (set stays incomplete there)"
+    try_up --mkpath "$SB/" "$(peer_dest "standby/$SN/")" || die "standby-set push to $PEER_NAME: MANIFEST did not go (set stays incomplete there): $LAST_FAIL"
   else
-    try_up --exclude MANIFEST.sha256 "$SB" "$(peer_dest standby/)" || die "standby-set push to $PEER_NAME failed"
+    try_up --exclude MANIFEST.sha256 "$SB" "$(peer_dest standby/)" || die "standby-set push to $PEER_NAME failed: $LAST_FAIL"
     PSTEP="standby manifest (4/4)"; PTOTAL=0
-    try_up "$SB" "$(peer_dest standby/)" || die "standby-set push to $PEER_NAME: MANIFEST did not go (set stays incomplete there)"
+    try_up "$SB" "$(peer_dest standby/)" || die "standby-set push to $PEER_NAME: MANIFEST did not go (set stays incomplete there): $LAST_FAIL"
   fi
   rm -rf "$SB"; SBS=yes
 fi
@@ -999,9 +1047,10 @@ DUR=$((SECONDS - T0))
 read -r SENT XFER <<<"$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("bytes_sent",0), d.get("transferred_file_bytes",0))' "$STATSF" 2>/dev/null || echo "0 0")"
 RATE=0; [ "$DUR" -gt 0 ] && RATE=$(( SENT / DUR / 1024 ))
 prog end OK "$((SENT / 1048576)) MB sent in ${DUR}s (${RATE} KB/s)"
-log "OK pushed through $N to $PEER_NAME in ${DUR}s: $((SENT / 1048576)) MB sent at ${RATE} KB/s ($((XFER / 1048576)) MB of file data; standby set as delta: ${DELTAOK:-0}), $ATTEMPTS rsync call(s) (standby set sent: $SBS)"
-status "OK push $N -> $PEER_NAME standby=$SBS ${DUR}s attempts=$ATTEMPTS sent=${SENT}B rate=${RATE}KB/s"
-state_put push result=OK at="$(date -Is)" set="$N" peer="$PEER_NAME" standby_set_sent="$SBS" duration_s="$DUR" attempts="$ATTEMPTS" transport="${PUSH_TRANSPORT:-ssh}" \
+log "OK pushed through $N to $PEER_NAME in ${DUR}s: $((SENT / 1048576)) MB sent at ${RATE} KB/s ($((XFER / 1048576)) MB of file data; standby set as delta: ${DELTAOK:-0}); attempts=$MAXTRY, $RETRIES failed tries, $CALLS rsync calls (standby set sent: $SBS)"
+status "OK push $N -> $PEER_NAME standby=$SBS ${DUR}s attempts=$MAXTRY retries=$RETRIES calls=$CALLS sent=${SENT}B rate=${RATE}KB/s path=${LPATH:-n/a}"
+state_put push result=OK at="$(date -Is)" set="$N" peer="$PEER_NAME" standby_set_sent="$SBS" duration_s="$DUR" attempts="$MAXTRY" retries="$RETRIES" rsync_calls="$CALLS" \
+  last_retry_reason="$LAST_FAIL" path="${LPATH:-}" transport="${PUSH_TRANSPORT:-ssh}" \
   waited_for_other_push_s="${PUSH_WAITED:-0}" waited_for_peer_s="$BUSY_WAIT" bytes_sent="$SENT" file_bytes="$XFER" rate_kbps="$RATE" \
   new_set_bytes="$NEWB" standby_bytes="$SBB" delta_standby="${DELTAOK:-0}"
 report_quiet
@@ -2375,13 +2424,15 @@ unit() { # unit NAME DESCRIPTION TIME|CALENDAR EXECSTART...   (HH:MM, or a full 
   local n="$1" d="$2" t="$3"; shift 3
   { echo "[Unit]"; echo "Description=$d"; echo "Wants=network-online.target"; echo "After=network-online.target docker.service"; echo
     echo "[Service]"; echo "Type=oneshot"; for e in "$@"; do echo "ExecStart=/bin/bash $B/$e"; done
-    echo "Nice=10"; echo "IOSchedulingClass=idle"; echo "TimeoutStartSec=4h"; } > "$BASE/systemd/$n.service"
+    echo "Nice=10"; echo "IOSchedulingClass=idle"; echo "TimeoutStartSec=${UNIT_TIMEOUT:-4h}"; } > "$BASE/systemd/$n.service"
   { echo "[Unit]"; echo "Description=$d (timer)"; echo; echo "[Timer]"; if [[ "$t" =~ ^[0-9]{2}:[0-9]{2}$ ]]; then echo "OnCalendar=*-*-* $t:00"; else echo "OnCalendar=$t"; fi; echo "RandomizedDelaySec=5m"; echo "Persistent=true"; echo
     echo "[Install]"; echo "WantedBy=timers.target"; } > "$BASE/systemd/$n.timer"
 }
 on()  { install -m 644 "$BASE/systemd/$1.service" "$SD/$1.service"; install -m 644 "$BASE/systemd/$1.timer" "$SD/$1.timer"; }
 off() { systemctl disable --now "$1.timer" >/dev/null 2>&1 || true; rm -f "$SD/$1.service" "$SD/$1.timer"; }
-unit erp-backup        "ERPNext ($ME) encrypted backup + push to $PEER_NAME" "$BACKUP_TIME" backup.sh push.sh
+# backup + push, and the on-demand push: a push may wait PUSH_WAIT_MIN (5 h) for another one and then run for hours over
+# a slow tailnet path. 4 h killed it mid-transfer with no FAIL recorded (SIGTERM); now 12 h, and push.sh records a stop.
+UNIT_TIMEOUT=12h unit erp-backup "ERPNext ($ME) encrypted backup + push to $PEER_NAME" "$BACKUP_TIME" backup.sh push.sh
 # weekly mode: wake daily at STANDBY_AT; the script refreshes on STANDBY_DAY, and retries the next nights after a deferral
 unit erp-standby       "ERPNext warm standby refresh of $PEER_NAME data ($STANDBY_EVERY)" "${STANDBY_AT:-05:30}" standby-refresh.sh
 unit erp-standby-now   "ERPNext standby catch-up restore (on demand; started by tick.sh when a set arrives late)" "*-*-* 00:00" "standby-refresh.sh --now --trigger=catch-up"
@@ -2390,7 +2441,7 @@ unit erp-offsite       "Copy ERPNext ($ME) encrypted archives to the second targ
 unit erp-scrub         "Re-verify every stored ERPNext backup set"           "${SCRUB_CALENDAR:-Sun *-*-* 08:30:00}" scrub.sh
 unit erp-watchdog      "erp-backup self-check and notification"              "${WATCHDOG_TIME:-07:45}" watchdog.sh
 unit erp-progress      "erp-backup live progress + resume of a failed push"   "*:0/2" tick.sh
-unit erp-push          "ERPNext ($ME) push to $PEER_NAME (on demand; started by tick.sh to resume a failed push)" "*-*-* 00:00" push.sh
+UNIT_TIMEOUT=12h unit erp-push "ERPNext ($ME) push to $PEER_NAME (on demand; started by tick.sh to resume a failed push)" "*-*-* 00:00" push.sh
 T2ON=0; [ "${TARGET2_KIND:-none}" != none ] && T2ON=1; ALWAYS=1
 if [ "$SEND_ENABLED" = 1 ];    then on erp-backup;     else off erp-backup; fi
 if [ "$STANDBY_ENABLED" = 1 ]; then on erp-standby;    else off erp-standby; fi
