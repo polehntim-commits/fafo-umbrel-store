@@ -86,5 +86,35 @@ FLAKY=0 run push.sh > /t/p5.log 2>&1
 check "recovers to OK, attempts=1" bash -c "[ \"$(st result)\" = OK ] && [ \"$(st attempts)\" = 1 ]"
 check "no unexpected-exit FAIL anywhere" bash -c "! grep -q 'ended unexpectedly' $A/erp-backup/status.log"
 
+echo "== run-now --push-only, foreground"
+newset 2026-10-27_0232; rm -f /t/flaky.count
+FLAKY=0 run run-now.sh --push-only > /t/r1.log 2>&1; RC=$?
+check "run-now exits 0" [ "$RC" = 0 ]
+check "run-now says the push ended OK" grep -q '^== push: OK 2026-10-27_0232' /t/r1.log
+check "run-now prints the summary" grep -q '^push   : OK set 2026-10-27_0232' /t/r1.log
+check "the push itself logged OK" grep -q 'OK push 2026-10-27_0232' "$A/erp-backup/status.log"
+
+echo "== run-now --push-only, foreground, peer down"
+newset 2026-10-28_0232; rm -f /t/flaky.count
+FLAKY=99 run run-now.sh --push-only > /t/r2.log 2>&1; RC=$?
+check "run-now exits non-zero" [ "$RC" != 0 ]
+check "run-now prints FAIL with the reason" grep -qE '^== push: FAIL \(exit 1\) - .*rc=255 ssh failed' /t/r2.log
+check "and still prints the summary" grep -q '^push   : FAIL' /t/r2.log
+
+echo "== run-now --push-only --detach"
+: > /t/systemd/.calls
+run run-now.sh --push-only --detach > /t/r3.log 2>&1; RC=$?
+check "detach starts erp-push.service" grep -q 'systemctl start --no-block erp-push.service' /t/systemd/.calls
+check "detach says so, and where to watch" bash -c "grep -q 'started in the background (erp-push.service)' /t/r3.log && grep -q 'progress.sh --watch' /t/r3.log"
+check "detach is logged" grep -q 'OK run-now push detached to erp-push.service' "$A/erp-backup/status.log"
+
+echo "== the real ssh path (no test stand-in): kits .3-.5 exited here silently, in init_ssh"
+newset 2026-10-29_0232
+( unset ERP_KIT_TEST_RSH; ERP_KIT_HOSTNAME=boxa bash "$A/erp-backup/bin/push.sh" ) > /t/p6.log 2>&1; RC=$?
+check "push.sh gets past ssh setup and tries the peer" grep -q 'try 1/3 of notice to beta (0/4) failed: rc=255' /t/p6.log
+check "and ends FAIL with a reason (no such host here)" bash -c "[ $RC != 0 ] && [ \"$(st result)\" = FAIL ] && sed -n 's/^msg=//p' $A/erp-backup/state/push.env | grep -q 'rc=255'"
+check "link-test.sh gets past ssh setup too" bash -c "( unset ERP_KIT_TEST_RSH; ERP_KIT_HOSTNAME=boxa bash $A/erp-backup/bin/link-test.sh ) 2>&1 | grep -q 'cannot reach beta\|tailnet path'"
+check "init_ssh returns 0 on a real box" bash -c "unset ERP_KIT_TEST_RSH; cd $A/erp-backup/bin && . ./common.sh && init_ssh && [ -n \"\$RSYNC_RSH\" ]"
+
 echo; echo "push-retry: $PASS passed, ${#FAILS[@]} failed"
 [ "${#FAILS[@]}" = 0 ] || { printf '  - %s\n' "${FAILS[@]}"; tail -n 30 "$A/erp-backup/status.log"; exit 1; }

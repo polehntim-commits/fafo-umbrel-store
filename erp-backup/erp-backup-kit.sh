@@ -382,7 +382,11 @@ init_ssh() { # SSH_ARGS (array, for ssh) and RSYNC_RSH (string, for rsync -e)
   read -r -a SSH_ARGS <<<"$base"
   RSYNC_RSH="ssh $base"
   if [ -n "$px" ]; then SSH_ARGS+=(-o "ProxyCommand=$px"); RSYNC_RSH="$RSYNC_RSH -o 'ProxyCommand=$px'"; fi
-  [ -n "${ERP_KIT_TEST_RSH:-}" ] && RSYNC_RSH="$ERP_KIT_TEST_RSH"   # tests only: a stand-in ssh that runs the real rrsync jail
+  # tests only: a stand-in ssh that runs the real rrsync jail. An "if", not "[ ] && x": as the function's last line that
+  # returned 1 whenever the variable was empty (every real box), and set -e then ended push.sh and link-test.sh at
+  # once, silently (kits 2026-10-19.3 to .5).
+  if [ -n "${ERP_KIT_TEST_RSH:-}" ]; then RSYNC_RSH="$ERP_KIT_TEST_RSH"; fi
+  return 0
 }
 peer_banner() { # first line the peer's sshd sends, via the same path SSH will use (empty if unreachable)
   local c
@@ -902,28 +906,30 @@ STAGE=push
 . "$(dirname "$0")/common.sh"
 need_root
 MODE="${1:-all}"
+PSET=""; PSTEP="start"; LAST_FAIL=""
+ERRF=$(mktemp)
+# Every way push.sh ends without success leaves result=FAIL in state/push.env, so PUSH_STALE_OR_FAILED is raised at
+# once: die() itself, a systemd stop or timeout (SIGTERM; kits before 2026-10-24.1 left the last OK in place), and any
+# unexpected exit - from the first line on (kits .3-.5 exited silently in init_ssh). die() sets _DIED, so a failure
+# is never recorded twice.
+on_exit() { local rc=$?; rm -f "$ERRF"; trap - EXIT; [ "$rc" = 0 ] || [ "${_DIED:-0}" = 1 ] || die "push.sh ended unexpectedly (exit $rc) during: ${PSTEP:-start}"; }
+trap on_exit EXIT
+trap 'die "push.sh was stopped by a signal during: ${PSTEP:-start} (systemd timeout or a manual stop)${LAST_FAIL:+; last failed attempt: $LAST_FAIL}"' TERM INT HUP
 if [ "$SEND_ENABLED" != 1 ]; then log "SEND_ENABLED=0, nothing to push"; exit 0; fi
 if [ "${PUSH_TRANSPORT:-ssh}" = local ]; then
   [ -n "${PEER_LOCAL_DIR:-}" ] && [ -d "$PEER_LOCAL_DIR" ] || die "PUSH_TRANSPORT=local but PEER_LOCAL_DIR '${PEER_LOCAL_DIR:-}' is not a directory"
   RSYNC_E=()
 else
   [ -f "$SSH_KEY" ] && [ -s "$KNOWN_HOSTS" ] || die "send key or known_hosts missing; run setup-send.sh"
-  init_ssh; RSYNC_E=(-e "$RSYNC_RSH")
+  PSTEP="ssh setup"; init_ssh; RSYNC_E=(-e "$RSYNC_RSH")
 fi
-PSET=""; PSTEP="start"
-ERRF=$(mktemp)
-# Every way push.sh ends without success leaves result=FAIL in state/push.env, so PUSH_STALE_OR_FAILED is raised at
-# once: die() itself, a systemd stop or timeout (SIGTERM; kits before 2026-10-24.1 left the last OK in place), and any
-# unexpected exit. die() sets _DIED, so a failure is never recorded twice.
-on_exit() { local rc=$?; rm -f "$ERRF"; trap - EXIT; [ "$rc" = 0 ] || [ "${_DIED:-0}" = 1 ] || die "push.sh ended unexpectedly (exit $rc) during: ${PSTEP:-start}"; }
-trap on_exit EXIT
-trap 'die "push.sh was stopped by a signal during: ${PSTEP:-start} (systemd timeout or a manual stop)${LAST_FAIL:+; last failed attempt: $LAST_FAIL}"' TERM INT HUP
+PSTEP="waiting for another push"
 wait_push_idle "push.sh $MODE"
 # Counters (2026-10-24.1). Kits up to 2026-10-19.5 logged "attempts=" as the number of rsync CALLS: 4 on a healthy
 # push in kit .1/.2, 6 in .3-.5. It read as "three failures, then success" but meant none failed.
 #   attempts = most tries any one step needed (1 = every step went through first time)
 #   retries  = failed tries in all (each logged with its reason)    calls = rsync runs in all
-T0=$SECONDS; CALLS=0; RETRIES=0; MAXTRY=0; BUSY_WAIT=0; LAST_FAIL=""
+T0=$SECONDS; CALLS=0; RETRIES=0; MAXTRY=0; BUSY_WAIT=0
 STATSF="$STATE/push-stats.json"; rm -f "$STATSF"
 BW=(); [ "${PUSH_BWLIMIT_KBPS:-0}" -gt 0 ] && BW=(--bwlimit="$PUSH_BWLIMIT_KBPS")
 # up ARGS... : one rsync. --info=progress2/--stats are client-side only (the peer's rrsync never sees them); the
@@ -1721,6 +1727,11 @@ cat > "$NB/run-now.sh" <<'EOF_RUNNOW'
 #   --restore     (standby box) also load the newest complete set into the standby and check it
 #   --restore-only (standby box) ONLY the restore test: no backup, no push, no second-target copy of this box's
 #                 own data - the quick check before an upgrade. Fails fast on a box without a standby.
+#   --detach      run the push in the background through erp-push.service: it keeps going after you log out.
+#                 It logs OK / FAIL (with the reason) to status.log like the nightly one; watch with progress.sh --watch.
+# Every step says how it ended ("== push: OK ..." / "== push: FAIL ..."), and the summary is printed even after a
+# failure; the exit code is non-zero if any step failed. (Kits .3-.5 returned to the prompt silently when push.sh
+# died in init_ssh: set -e ended run-now too, before the summary.)
 # A push already running (the nightly one takes hours) is waited for, with progress every 5 minutes, not
 # fought with. push.sh on its own does the same and is always safe to re-run: it never deletes on the peer,
 # re-sends whatever the peer is missing, and sends the waiting standby set until one push of it succeeds.
@@ -1728,19 +1739,49 @@ set -euo pipefail
 STAGE=run-now
 . "$(dirname "$0")/common.sh"
 need_root
-B="$(dirname "$0")"; RESTORE=0; PUSHONLY=0; RONLY=0
-for a in "$@"; do case "$a" in --restore) RESTORE=1;; --restore-only) RESTORE=1; RONLY=1;; --push-only) PUSHONLY=1;;
-  *) echo "Usage: sudo bash $0 [--push-only] [--restore | --restore-only]"; exit 1;; esac; done
+B="$(dirname "$0")"; RESTORE=0; PUSHONLY=0; RONLY=0; DETACH=0; RC=0
+for a in "$@"; do case "$a" in --restore) RESTORE=1;; --restore-only) RESTORE=1; RONLY=1;; --push-only) PUSHONLY=1;; --detach) DETACH=1;;
+  *) echo "Usage: sudo bash $0 [--push-only] [--detach] [--restore | --restore-only]"; exit 1;; esac; done
 [ "$RONLY" = 1 ] && [ "$PUSHONLY" = 1 ] && { echo "--restore-only and --push-only exclude each other"; exit 1; }
 if [ "$RONLY" = 1 ] && [ "$STANDBY_ENABLED" != 1 ]; then echo "--restore-only: this box holds no standby (STANDBY_ENABLED=0); run it on the standby box"; exit 1; fi
+# ended STAGE RC : one line on how a step ended, from its own state file (push.sh / backup.sh write the reason there)
+ended() {
+  if [ "$2" = 0 ]; then echo "== $1: OK $(state_get "$1" set)"
+  else echo "== $1: FAIL (exit $2) - $(state_get "$1" msg | cut -c1-400)"; RC=1; fi
+  return 0
+}
 if [ "$SEND_ENABLED" = 1 ] && [ "$RONLY" = 0 ]; then
-  if [ "$PUSHONLY" = 0 ]; then echo "== backup"; BACKUP_LOCK_WAIT_S="${BACKUP_LOCK_WAIT_S:-3600}" bash "$B/backup.sh"; fi
-  echo "== push to $PEER_NAME (waits for a push already in progress)"; PUSH_RETRY_SLEEP="${PUSH_RETRY_SLEEP:-60}" bash "$B/push.sh"
+  BOK=1
+  if [ "$PUSHONLY" = 0 ]; then
+    echo "== backup"; r=0; BACKUP_LOCK_WAIT_S="${BACKUP_LOCK_WAIT_S:-3600}" bash "$B/backup.sh" || r=$?
+    ended backup "$r"; [ "$r" = 0 ] || BOK=0
+  fi
+  if [ "$BOK" = 0 ]; then
+    echo "== push: skipped (the backup failed; the last complete set goes with the next push)"
+  elif [ "$DETACH" = 1 ] && [ -f "${ERP_KIT_SYSTEMD_DIR:-/etc/systemd/system}/erp-push.service" ] && command -v systemctl >/dev/null; then
+    if systemctl is-active --quiet erp-push.service; then echo "== push: erp-push.service is already running a push; it continues"
+    else systemctl start --no-block erp-push.service && echo "== push to $PEER_NAME started in the background (erp-push.service)"; fi
+    status "OK run-now push detached to erp-push.service"
+    echo "   watch it:  sudo bash $B/progress.sh --watch      log:  journalctl -u erp-push.service -f"
+    echo "   it ends with an OK push / FAIL push line in $STATUS"
+  elif [ "$DETACH" = 1 ]; then
+    setsid bash "$B/push.sh" >>"$STATE/push-detached.log" 2>&1 < /dev/null &
+    status "OK run-now push detached (pid $!, output in $STATE/push-detached.log)"
+    echo "== push to $PEER_NAME started in the background (pid $!); output: $STATE/push-detached.log"
+  else
+    echo "== push to $PEER_NAME (waits for a push already in progress)"; r=0
+    PUSH_RETRY_SLEEP="${PUSH_RETRY_SLEEP:-60}" bash "$B/push.sh" || r=$?
+    ended push "$r"
+  fi
 fi
-[ "${TARGET2_KIND:-none}" != none ] && [ "$PUSHONLY" = 0 ] && [ "$RONLY" = 0 ] && { echo "== second target"; bash "$B/offsite.sh"; }
-[ "$RESTORE" = 1 ] && { echo "== restore test"; bash "$B/standby-refresh.sh" --now --wait-min=0 --trigger=run-now; }
+if [ "${TARGET2_KIND:-none}" != none ] && [ "$PUSHONLY" = 0 ] && [ "$RONLY" = 0 ]; then
+  echo "== second target"; r=0; bash "$B/offsite.sh" || r=$?; ended offsite "$r"
+fi
+if [ "$RESTORE" = 1 ]; then
+  echo "== restore test"; r=0; bash "$B/standby-refresh.sh" --now --wait-min=0 --trigger=run-now || r=$?; ended standby "$r"
+fi
 bash "$B/report.sh" >/dev/null 2>&1 || true
-python3 - "$BASE/status.json" <<'PY'
+python3 - "$BASE/status.json" <<'PY' || echo "(no status.json to summarise)"
 import json, sys
 s = json.load(open(sys.argv[1]))
 b, p = s.get("own_backup") or {}, s.get("push") or {}
@@ -1753,6 +1794,7 @@ r = s.get("standby_of_peer") or {}
 if r.get("at"): print(f'restore: {r.get("result")} check {r.get("check")} set {r.get("set")} at {r.get("at")}')
 for a in s.get("alerts", []): print(f'  {a["level"]:8} {a["code"]}: {a["message"]}')
 PY
+exit "$RC"
 EOF_RUNNOW
 
 # ---------------------------------------------------------------- set-conf.sh
