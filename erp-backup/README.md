@@ -144,6 +144,57 @@ Every failed try leaves a line with its reason, in the journal and in `status.lo
 - `erp-backup.service` (backup + push) and `erp-push.service` may run 12 h. Other units keep 4 h. A push can wait
   up to `PUSH_WAIT_MIN` (5 h) for another one, so 4 h could cut a slow push off.
 
+### Over a relayed link (Tailscale DERP, about 1 Mbit/s)
+
+A push of a 563 MB set plus its standby delta takes one to three hours through a relay. From 2026-10-24.1 a push is
+built for that:
+
+- **Resumable.** `--partial` keeps a cut-off file on the peer. The encrypted archives go with `--append-verify`: the
+  next try sends only the missing end, then checks the whole file and sends it again if it does not match.
+  Sets never change once made; receipts, which do, never go in that mode.
+- **Fails on no progress, not on slowness.**
+  - rsync gives up only when nothing moves for `PUSH_STALL_S` (900 s).
+  - ssh allows 5 min of keepalive silence (30 s x 10). A relay that also carries other traffic delays the
+    keepalive reply, and the old 1 min cut working transfers off.
+- **Progress-based retries.** A try that moved at least 1 MB before it broke does not use up the step's 3 tries; the
+  next one resumes. Three tries in a row that move nothing end the step.
+- **Deadline.** The whole push, including any wait for another push, must end by `PUSH_DEADLINE_MIN` (660 min; the
+  unit allows 12 h). When it passes: `FAIL push ... did not finish within 660 min: stopped during <step>; N MB sent in
+  M min (~R KB/s), path derp sea 38 ms`. `PUSH_STALE_OR_FAILED` is raised. What arrived stays on the peer, and the
+  next push (the 2-minute tick resumes a failed one after an hour) continues it.
+- **On record.**
+  - At the start: the path from `tailscale status` / `ping` (direct with endpoint, or DERP with region and ping), the
+    MB to send, and the estimate from the last push's rate.
+  - Every `PUSH_LOG_EVERY_S` (600 s): bytes, rate and ETA in the journal.
+  - On each failed try: the path again.
+  - At the end: `rate=` and `path=` on the OK line, and in `state/link.env`, which feeds `LINK_RELAYED`.
+- **The push lock does not leak.** rsync and ssh no longer inherit `.push.lock`. An ssh or ProxyCommand left behind
+  by a broken connection used to hold it, and the next push waited for "another push".
+- `PUSH_BWLIMIT_KBPS` caps a push when the same path has to carry something else, e.g. an image copy.
+
+#### Getting a direct path (check only; the kit changes no Tailscale setting)
+
+Read-only, on each box (the Tailscale container is normally `tailscale_web_1`):
+
+    sudo docker exec tailscale_web_1 tailscale netcheck
+    sudo docker exec tailscale_web_1 tailscale ping -c 5 <peer tailnet IP>
+    sudo docker exec tailscale_web_1 tailscale status
+
+- `ping` answers `via DERP(sea)` on a relay, and `via <public ip>:<port>` on a direct path.
+- In `netcheck`, compare the two boxes:
+  - `UDP: false`: UDP is blocked outbound. Direct is impossible from that box.
+  - `MappingVariesByDestIP: true`: "hard" (symmetric) NAT. When BOTH boxes have it, they stay on DERP.
+  - `PortMapping:` names UPnP, NAT-PMP or PCP if the router offers one, so Tailscale can open a port by itself.
+    Empty means it cannot.
+  - `Nearest DERP` and the IPv4 / IPv6 lines: a box with working IPv6 on both ends often goes direct over IPv6.
+- On the router at the box that shows hard NAT or no port mapping:
+  - enable UPnP or NAT-PMP; or
+  - forward UDP 41641 to that box (Tailscale's default port; check that tailscaled uses it);
+  - allow outbound UDP.
+- An ISP's carrier-grade NAT (a WAN address in 100.64.0.0/10 on the router) also blocks the forward. It then needs
+  the ISP, or IPv6.
+- Userspace networking (`tun=no`) does not stop a direct path.
+
 ### Kits 2026-10-19.3 to .5: every push over ssh stopped before it started
 
 `init_ssh` ended with `[ -n "${ERP_KIT_TEST_RSH:-}" ] && RSYNC_RSH=...`. On a real box that variable is empty, so the

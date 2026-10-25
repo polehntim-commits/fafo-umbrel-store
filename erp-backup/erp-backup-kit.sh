@@ -178,6 +178,10 @@ addconf PUSH_BWLIMIT_KBPS 0
 addconf DELTA_STANDBY 1
 addconf PUSH_RESUME_AFTER_MIN 60
 addconf PUSH_RESUME_MAX_PER_DAY 6
+# a push over a relayed (DERP, ~1 Mbit/s) path: give up only when nothing moves for PUSH_STALL_S, or at the deadline
+addconf PUSH_STALL_S 900
+addconf PUSH_DEADLINE_MIN 660
+addconf PUSH_LOG_EVERY_S 600
 addconf LINK_MIN_RATE_KBPS 1000
 addconf PUSH_TRANSPORT ssh
 addconf PEER_LOCAL_DIR '""'
@@ -376,9 +380,11 @@ ssh_proxy() { # ProxyCommand value, or empty for direct
   local c; c=$(find_ts_container); [ -n "$c" ] || return 0
   echo "docker exec -i $c tailscale${TS_SOCKET:+ --socket=$TS_SOCKET} nc %h %p"
 }
+# Keepalive budget 30 s x 10 = 5 min (was 15 s x 4 = 1 min). Over a relayed path that also carries other traffic, the
+# keepalive reply queues behind megabytes of data; one minute cut working transfers off.
 init_ssh() { # SSH_ARGS (array, for ssh) and RSYNC_RSH (string, for rsync -e)
   local px; px=$(ssh_proxy)
-  local base="-i $SSH_KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
+  local base="-i $SSH_KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=10"
   read -r -a SSH_ARGS <<<"$base"
   RSYNC_RSH="ssh $base"
   if [ -n "$px" ]; then SSH_ARGS+=(-o "ProxyCommand=$px"); RSYNC_RSH="$RSYNC_RSH -o 'ProxyCommand=$px'"; fi
@@ -906,7 +912,10 @@ STAGE=push
 . "$(dirname "$0")/common.sh"
 need_root
 MODE="${1:-all}"
-PSET=""; PSTEP="start"; LAST_FAIL=""
+PSET=""; PSTEP="start"; LAST_FAIL=""; LPATH=""; LDESC=""
+# The whole push, waiting for another one included, must end by DEADLINE (PUSH_DEADLINE_MIN, 11 h; the unit allows
+# 12 h). Within it, a try fails only when nothing moves for PUSH_STALL_S - never because it is slow.
+PUSH_EPOCH0=$(date +%s); DLS=${PUSH_DEADLINE_S:-$(( ${PUSH_DEADLINE_MIN:-660} * 60 ))}; DEADLINE=$(( PUSH_EPOCH0 + DLS ))   # PUSH_DEADLINE_S: tests only
 ERRF=$(mktemp)
 # Every way push.sh ends without success leaves result=FAIL in state/push.env, so PUSH_STALE_OR_FAILED is raised at
 # once: die() itself, a systemd stop or timeout (SIGTERM; kits before 2026-10-24.1 left the last OK in place), and any
@@ -933,15 +942,42 @@ T0=$SECONDS; CALLS=0; RETRIES=0; MAXTRY=0; BUSY_WAIT=0
 STATSF="$STATE/push-stats.json"; rm -f "$STATSF"
 BW=(); [ "${PUSH_BWLIMIT_KBPS:-0}" -gt 0 ] && BW=(--bwlimit="$PUSH_BWLIMIT_KBPS")
 # up ARGS... : one rsync. --info=progress2/--stats are client-side only (the peer's rrsync never sees them); the
-# output feeds progress.py, which keeps state/progress.json current and adds the byte counts to push-stats.json.
+# output feeds progress.py, which keeps state/progress.json current, logs throughput every PUSH_LOG_EVERY_S and adds
+# the byte counts (of failed calls too) to push-stats.json.
+#   --partial always: a cut-off file stays on the peer and the next try continues it.
+#   UPMODE=append (the encrypted archives): --append-verify sends only the missing end of a cut-off file, then checks
+#     the whole file and sends it again if the part on the peer does not match. Sets never change once made.
+#   --timeout=PUSH_STALL_S: rsync gives up only when NO data moves for that long, however slow the link.
+#   timeout(1) ends the call at the push's DEADLINE (rc 124).
 up() {
-  local rc
+  local rc rem mode=(); rem=$(( DEADLINE - $(date +%s) )); [ "$rem" -gt 0 ] || return 124
+  [ "${UPMODE:-}" = append ] && mode=(--append-verify)
   prog begin push "$PSTEP" "$PSET" --total "${PTOTAL:-0}"
   set +e
-  rsync -aH --partial --timeout=600 --exclude '*.partial' "${BW[@]}" --info=progress2 --stats "${RSYNC_E[@]}" "$@" 2>"$ERRF" \
-    | ERPB_STATE="$STATE" ERPB_ME="$ME" ERPB_REPORT="$(dirname "$0")/report.sh" python3 "$(dirname "$0")/progress.py" rsync "$STATSF"
+  # 8>&- : the push lock (fd 8) must not leak into rsync / ssh / the ProxyCommand. A child left behind by a broken
+  # connection then held the lock, and the next push waited for "another push" for up to PUSH_WAIT_MIN.
+  timeout -s TERM "$rem" rsync -aH --partial "${mode[@]}" --timeout="${PUSH_STALL_S:-900}" --exclude '*.partial' "${BW[@]}" --info=progress2 --stats "${RSYNC_E[@]}" "$@" 2>"$ERRF" 8>&- \
+    | ERPB_STATE="$STATE" ERPB_ME="$ME" ERPB_LOG_EVERY="${PUSH_LOG_EVERY_S:-600}" ERPB_LOG_TAG="${LPATH:+path=$LPATH}" ERPB_REPORT="$(dirname "$0")/report.sh" \
+      python3 "$(dirname "$0")/progress.py" rsync "$STATSF" 8>&-
   rc=${PIPESTATUS[0]}; set -e
   cat "$ERRF" >&2; return "$rc"
+}
+# last_call_mb : MB the last rsync call moved before it ended (progress2's counter; also known when it failed)
+last_call_mb() { python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("last_call_bytes", 0)) // 1048576)' "$STATSF" 2>/dev/null || echo 0; }
+sent_mb() { python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("bytes_sent", 0)) // 1048576)' "$STATSF" 2>/dev/null || echo 0; }
+# probe_path : LPATH (direct|derp|unknown) and LDESC ("derp sea 38 ms") from the Tailscale container. Read-only, a few s.
+probe_path() {
+  [ "${PUSH_TRANSPORT:-ssh}" = ssh ] && [ -z "${ERP_KIT_TEST_RSH:-}" ] || return 0
+  local lp; lp=$(link_probe 2>/dev/null || true)
+  LPATH=$(sed -n 's/^path=//p' <<<"$lp"); LPATH="${LPATH:-unknown}"
+  LDESC="$LPATH$(sed -n 's/^derp=/ /p; s/^endpoint=/ /p' <<<"$lp")$(sed -n 's/^ping_ms=\(.*\)/ \1 ms/p' <<<"$lp")"
+  # shellcheck disable=SC2046
+  state_put link at="$(date -Is)" $(tr '\n' ' ' <<<"$lp") last_push_rate_kbps="$(state_get push rate_kbps)"
+  return 0
+}
+deadline_fail() {
+  local el=$(( $(date +%s) - PUSH_EPOCH0 )) mb; mb=$(sent_mb)
+  die "push to $PEER_NAME did not finish within $(( DLS / 60 )) min $(( DLS % 60 )) s (PUSH_DEADLINE_MIN): stopped during $PSTEP; ${mb} MB sent in $((el / 60)) min (~$(( el > 0 ? mb * 1024 / el : 0 )) KB/s)${LDESC:+, path $LDESC}. What arrived is kept on $PEER_NAME; the next push continues it.${LAST_FAIL:+ Last failed try: $LAST_FAIL}"
 }
 # fail_reason RC : one line on why an rsync call failed - rsync's exit code in words plus what ssh / rsync / rrsync
 # printed (stderr of that call; it never holds secrets). Goes to the journal, status.log and state/push.env.
@@ -955,7 +991,8 @@ fail_reason() {
     20) what="stopped by a signal";;
     23) what="partial transfer (some files failed)";;
     24) what="source files vanished";;
-    30) what="rsync timeout: no data for 600 s";;
+    30) what="stalled: no data moved for ${PUSH_STALL_S:-900} s";;
+    124) what="the push deadline passed";;
     35) what="timeout waiting for the peer";;
     255) what="ssh failed (no connection, refused or dropped)";;
     *) what="rsync exit $rc";;
@@ -965,26 +1002,40 @@ fail_reason() {
          | tr -d '\r' | tr '\n' ' ' | tr -s ' ' | cut -c1-240)
   echo "rc=$rc $what${msg:+ - $msg}"
 }
-# try_up ARGS... : up to 3 tries of one step. The peer's rrsync refusing because another push is still writing
-# there (e.g. one started by an older kit that holds no lock) is NOT a failed try: wait and try again.
-# Each failed try is logged with its reason. The retry waits 60 s, then PUSH_RETRY_SLEEP (300 s).
+# try_up ARGS... : one step, retried. The budget is PROGRESS, not time:
+#   - a try that moved at least 1 MB before it broke does not use up the step's tries: the next one resumes it;
+#   - 3 tries in a row that moved nothing end the step;
+#   - the push's DEADLINE ends everything, with a FAIL that says how far it got.
+# The peer's rrsync refusing because another push is still writing there (e.g. one started by an older kit that
+# holds no lock) is NOT a failed try: wait and try again. Each failed try is logged with its reason and the path.
+# The retry waits 30 s after a try that made progress, else 60 s, then PUSH_RETRY_SLEEP (300 s).
 try_up() {
-  local t=1 rc poll="${PUSH_WAIT_POLL_S:-60}" max=$(( ${PUSH_WAIT_MIN:-300} * 60 )) why pause
+  local t=1 n=0 rc poll="${PUSH_WAIT_POLL_S:-60}" max=$(( ${PUSH_WAIT_MIN:-300} * 60 )) why pause moved
   while :; do
-    CALLS=$((CALLS + 1)); rc=0
+    CALLS=$((CALLS + 1)); n=$((n + 1)); rc=0
     up "$@" || rc=$?
-    if [ "$rc" = 0 ]; then [ "$t" -gt "$MAXTRY" ] && MAXTRY=$t; return 0; fi
+    if [ "$rc" = 0 ]; then [ "$n" -gt "$MAXTRY" ] && MAXTRY=$n; return 0; fi
+    [ "$rc" = 124 ] && deadline_fail
     if grep -q "Another instance of rrsync is already accessing" "$ERRF"; then
       [ "$BUSY_WAIT" -ge "$max" ] && { LAST_FAIL="$PSTEP: $PEER_NAME still busy with another push after ${PUSH_WAIT_MIN:-300} min"; log "$LAST_FAIL"; return 1; }
       [ $(( BUSY_WAIT % 300 )) -lt "$poll" ] && log "$PEER_NAME is still receiving another push (its rrsync lock), waiting... ($((BUSY_WAIT / 60)) of ${PUSH_WAIT_MIN:-300} min)"
       sleep "$poll"; BUSY_WAIT=$((BUSY_WAIT + poll)); continue
     fi
-    why=$(fail_reason "$rc"); RETRIES=$((RETRIES + 1)); [ "$t" -gt "$MAXTRY" ] && MAXTRY=$t
+    moved=$(last_call_mb); probe_path
+    why="$(fail_reason "$rc")${LDESC:+ [path $LDESC]}"; RETRIES=$((RETRIES + 1)); [ "$n" -gt "$MAXTRY" ] && MAXTRY=$n
+    if [ "$moved" -ge 1 ]; then
+      LAST_FAIL="$PSTEP, try $n (moved ${moved} MB first): $why"
+      log "try $n of $PSTEP broke after moving ${moved} MB: $why - resuming in 30 s (what arrived is kept)"
+      status "WARN push $PSET try $n broke after ${moved} MB ($PSTEP): $why - resuming"
+      [ $(( DEADLINE - $(date +%s) )) -gt 30 ] || deadline_fail
+      sleep 30; t=1; continue
+    fi
     LAST_FAIL="$PSTEP, try $t/3: $why"
     # the peer's rrsync refusing an option or a path is permanent: retrying cannot change it
     if grep -q "rrsync error:" "$ERRF"; then log "$PEER_NAME's rrsync refused this transfer ($PSTEP): $why"; status "WARN push $PSET refused by $PEER_NAME's rrsync ($PSTEP): $why"; return 1; fi
     if [ "$t" -ge 3 ]; then log "try $t/3 of $PSTEP failed: $why - giving up"; status "WARN push $PSET try $t/3 failed ($PSTEP): $why"; return 1; fi
     pause="${PUSH_RETRY_SLEEP:-300}"; [ "$t" = 1 ] && [ "$pause" -gt 60 ] && pause=60
+    [ $(( DEADLINE - $(date +%s) )) -gt "$pause" ] || deadline_fail
     log "try $t/3 of $PSTEP failed: $why - trying again in ${pause}s"
     status "WARN push $PSET try $t/3 failed ($PSTEP): $why"
     sleep "$pause"; t=$((t + 1))
@@ -1010,18 +1061,15 @@ inflight() { printf '{"schema":"erp-backup-inflight/1","box":"%s","state":"%s","
 PSTART=$(date -Is); inflight sending
 # how packets reach the peer tonight (read-only: tailscale status + 3 pings in the Tailscale container, a few seconds).
 # A slow push then says why: path=derp is Tailscale's relay (about 1 Mbit/s), path=direct is not.
-LPATH=""
-if [ "${PUSH_TRANSPORT:-ssh}" = ssh ] && [ -z "${ERP_KIT_TEST_RSH:-}" ]; then
-  LP=$(link_probe 2>/dev/null || true); LPATH=$(sed -n 's/^path=//p' <<<"$LP"); LPATH="${LPATH:-unknown}"
-  # shellcheck disable=SC2046
-  state_put link at="$(date -Is)" $(tr '\n' ' ' <<<"$LP") last_push_rate_kbps="$(state_get push rate_kbps)"
-  log "path to $PEER_NAME: $(tr '\n' ' ' <<<"$LP")"
-fi
+probe_path
+LASTR=$(state_get push rate_kbps); NEEDMB=$(( (NEWB + SBB) / 1048576 ))
+log "path to $PEER_NAME: ${LDESC:-n/a}; up to ${NEEDMB} MB to send (the standby set goes as a delta, usually far less)${LASTR:+; the last push ran at ${LASTR} KB/s, so up to ~$(( LASTR > 0 ? NEEDMB * 1024 / LASTR / 60 : 0 )) min}; deadline $(date -d @"$DEADLINE" +%H:%M)"
 PSTEP="notice to $PEER_NAME (0/4)"; PTOTAL=0
 try_up "$BASE/own/receipts" "$(peer_dest)" || die "push to $PEER_NAME ($PEER_HOST) failed ($(link_desc)${LPATH:+ path=$LPATH}): $LAST_FAIL"
 SRC=("$BASE/own/daily" "$BASE/own/weekly" "$BASE/own/monthly" "$BASE/own/receipts")
 PSTEP="encrypted archives (1/4)"; PTOTAL="$NEWB"
-try_up --exclude SHA256SUMS "${SRC[@]}" "$(peer_dest)" || die "archive push to $PEER_NAME ($PEER_HOST) failed ($(link_desc)${LPATH:+ path=$LPATH}): $LAST_FAIL"
+# the sets only (receipts change in place, so they never go in append mode; they ride in the other calls)
+UPMODE=append try_up --exclude SHA256SUMS "$BASE/own/daily" "$BASE/own/weekly" "$BASE/own/monthly" "$(peer_dest)" || die "archive push to $PEER_NAME ($PEER_HOST) failed ($(link_desc)${LPATH:+ path=$LPATH}): $LAST_FAIL"
 PSTEP="archive completion markers (2/4)"; PTOTAL=0
 try_up "${SRC[@]}" "$(peer_dest)" || die "archive push to $PEER_NAME: the completion markers did not go (sets stay incomplete there): $LAST_FAIL"
 if [ -n "$SB" ]; then
@@ -1050,13 +1098,14 @@ if [ -n "$SB" ]; then
 fi
 inflight "done"; PSTEP="finish"; PTOTAL=0; try_up "$BASE/own/receipts" "$(peer_dest)" || true
 DUR=$((SECONDS - T0))
+probe_path   # the path at the end too: it can change during a long push
 read -r SENT XFER <<<"$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("bytes_sent",0), d.get("transferred_file_bytes",0))' "$STATSF" 2>/dev/null || echo "0 0")"
 RATE=0; [ "$DUR" -gt 0 ] && RATE=$(( SENT / DUR / 1024 ))
 prog end OK "$((SENT / 1048576)) MB sent in ${DUR}s (${RATE} KB/s)"
 log "OK pushed through $N to $PEER_NAME in ${DUR}s: $((SENT / 1048576)) MB sent at ${RATE} KB/s ($((XFER / 1048576)) MB of file data; standby set as delta: ${DELTAOK:-0}); attempts=$MAXTRY, $RETRIES failed tries, $CALLS rsync calls (standby set sent: $SBS)"
-status "OK push $N -> $PEER_NAME standby=$SBS ${DUR}s attempts=$MAXTRY retries=$RETRIES calls=$CALLS sent=${SENT}B rate=${RATE}KB/s path=${LPATH:-n/a}"
+status "OK push $N -> $PEER_NAME standby=$SBS ${DUR}s attempts=$MAXTRY retries=$RETRIES calls=$CALLS sent=${SENT}B rate=${RATE}KB/s path=${LDESC:-n/a}"
 state_put push result=OK at="$(date -Is)" set="$N" peer="$PEER_NAME" standby_set_sent="$SBS" duration_s="$DUR" attempts="$MAXTRY" retries="$RETRIES" rsync_calls="$CALLS" \
-  last_retry_reason="$LAST_FAIL" path="${LPATH:-}" transport="${PUSH_TRANSPORT:-ssh}" \
+  last_retry_reason="$LAST_FAIL" path="${LPATH:-}" path_detail="${LDESC:-}" transport="${PUSH_TRANSPORT:-ssh}" \
   waited_for_other_push_s="${PUSH_WAITED:-0}" waited_for_peer_s="$BUSY_WAIT" bytes_sent="$SENT" file_bytes="$XFER" rate_kbps="$RATE" \
   new_set_bytes="$NEWB" standby_bytes="$SBB" delta_standby="${DELTAOK:-0}"
 report_quiet
@@ -2082,7 +2131,8 @@ UNITS = {"B": 1, "kB": 1e3, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 
 
 def cmd_rsync(a):
     """stdin: rsync --info=progress2 --stats. Updates the current step; adds the call's byte counts to STATSFILE."""
-    statsfile = a[0]; last = 0.0; sent = None; xfer = None; buf = ""
+    statsfile = a[0]; last = 0.0; sent = None; xfer = None; buf = ""; done = 0
+    every = int(E.get("ERPB_LOG_EVERY") or 0); tag = E.get("ERPB_LOG_TAG", ""); lastlog = time.time()
     stdin = sys.stdin.buffer
     while True:
         ch = stdin.read(1)
@@ -2094,6 +2144,9 @@ def cmd_rsync(a):
         if m:
             done = int(m.group(1).replace(",", "")); pct = int(m.group(2))
             rate = float(m.group(3)) * UNITS.get(m.group(4), 1); eta = int(m.group(5)) * 3600 + int(m.group(6)) * 60 + int(m.group(7))
+            if every and time.time() - lastlog >= every:   # throughput in the journal, so a slow night is on record
+                lastlog = time.time(); d = compute(load(CUR) or {})
+                print(f"{iso()} [{ME}/push] {d.get('step', '?')}: {line_for(d) or human(done)} {tag}".rstrip(), flush=True)
             if time.time() - last >= 2:
                 d = load(CUR)
                 if d:
@@ -2114,7 +2167,9 @@ def cmd_rsync(a):
         m3 = re.match(r"Total transferred file size:\s*(\d+)", s)
         if m3: xfer = int(m3.group(1))
     st = load(statsfile) or {"bytes_sent": 0, "transferred_file_bytes": 0, "calls": 0}
-    st["bytes_sent"] += sent or 0; st["transferred_file_bytes"] += xfer or 0; st["calls"] += 1
+    # a call that broke prints no --stats: count what its progress counter saw, so the rate covers failed tries too
+    st["bytes_sent"] += sent if sent is not None else done; st["transferred_file_bytes"] += xfer or 0; st["calls"] += 1
+    st["last_call_bytes"] = done if sent is None else max(done, xfer or 0)
     save(statsfile, st)
 
 
@@ -2404,7 +2459,7 @@ if E["ERPB_RECV"] == "1" and (st["check"].get("incomplete_newer") or "").strip()
     A("warning", "PEER_SET_INCOMPLETE", f"peer set(s) newer than the newest complete one never finished: {st['check'].get('incomplete_newer')}")
 lk = st["link"]
 if E["ERPB_SEND"] == "1" and lk.get("path") == "derp":
-    A("warning", "LINK_RELAYED", f"pushes to the peer go through Tailscale's DERP relay ({lk.get('derp')}), not a direct path - expect about 1 Mbit/s; last push {st['push'].get('rate_kbps', '?')} KB/s")
+    A("warning", "LINK_RELAYED", f"pushes to the peer go through Tailscale's DERP relay ({lk.get('derp')}), not a direct path - expect about 1 Mbit/s; " + (f"last push {st['push']['rate_kbps']} KB/s" if st['push'].get('rate_kbps') else "no push measured yet (kit 2026-10-19.3+ measures it)"))
 elif E["ERPB_SEND"] == "1" and st["push"].get("rate_kbps", "").isdigit() and int(st["push"]["rate_kbps"]) < int(E.get("ERPB_LINKMIN") or 1000) and int(st["push"].get("bytes_sent") or 0) > 50 * 1048576:
     A("warning", "LINK_SLOW", f"last push ran at {st['push']['rate_kbps']} KB/s ({lk.get('path') or 'path unknown'}{', userspace networking' if lk.get('tun') == 'no' else ''})")
 sr = st["standby_run"]

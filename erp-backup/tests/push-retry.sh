@@ -19,9 +19,9 @@ check "unit timeout for backup+push is 12h" grep -q '^TimeoutStartSec=12h' "$A/e
 check "unit timeout for on-demand push is 12h" grep -q '^TimeoutStartSec=12h' "$A/erp-backup/systemd/erp-push.service"
 check "other units keep 4h" grep -q '^TimeoutStartSec=4h' "$A/erp-backup/systemd/erp-standby.service"
 
-newset() { # newset STAMP : one complete encrypted set + one plaintext standby set
+newset() { # newset STAMP [ARCHIVE_BYTES] : one complete encrypted set + one plaintext standby set
   local d="$A/erp-backup/own/daily/$1" w="$A/erp-backup/work/standby/$1"
-  mkdir -p "$d" "$w"; head -c 3000000 /dev/urandom > "$d/x-database.sql.gz.age"; echo r > "$d/RECIPIENT.txt"
+  mkdir -p "$d" "$w"; head -c "${2:-3000000}" /dev/urandom > "$d/x-database.sql.gz.age"; echo r > "$d/RECIPIENT.txt"
   ( cd "$d" && sha256sum -- * > SHA256SUMS )
   find "$A/erp-backup/work/standby" -mindepth 1 -maxdepth 1 -type d ! -name "$1" -exec rm -rf {} +
   head -c 2000000 /dev/urandom > "$w/x-database.sql.gz"; ( cd "$w" && sha256sum -- * > MANIFEST.sha256 )
@@ -116,5 +116,64 @@ check "and ends FAIL with a reason (no such host here)" bash -c "[ $RC != 0 ] &&
 check "link-test.sh gets past ssh setup too" bash -c "( unset ERP_KIT_TEST_RSH; ERP_KIT_HOSTNAME=boxa bash $A/erp-backup/bin/link-test.sh ) 2>&1 | grep -q 'cannot reach beta\|tailnet path'"
 check "init_ssh returns 0 on a real box" bash -c "unset ERP_KIT_TEST_RSH; cd $A/erp-backup/bin && . ./common.sh && init_ssh && [ -n \"\$RSYNC_RSH\" ]"
 
+echo "== relayed link: a connection that drops mid-transfer is resumed, not restarted"
+# 8 MB at 1000 KB/s; the first connection is cut after 3 s (about 3 MB in), the rest go through
+# Like a real tailnet: the receiver runs in its own session behind two pipes, so a signal to this side never reaches
+# it; it only sees its input end, as the far box sees a dropped connection - and keeps the partial file.
+cat > /t/drop-ssh <<'EOF'
+#!/bin/bash
+n=$(cat /t/drop.count 2>/dev/null || echo 0); echo $((n + 1)) > /t/drop.count
+f=$(mktemp -u); mkfifo "$f"
+if [ "$n" = "${DROP_AT:-1}" ]; then timeout -s KILL 3 cat <&0 > "$f" & else cat <&0 > "$f" & fi; CP=$!
+setsid /usr/local/bin/fake-ssh "$@" < "$f" | cat; rc=${PIPESTATUS[0]}
+kill "$CP" 2>/dev/null; rm -f "$f"
+[ "$n" = "${DROP_AT:-1}" ] && exit 255; exit "$rc"
+EOF
+chmod +x /t/drop-ssh; rm -f /t/drop.count
+# send what earlier (deliberately failed) cases left waiting, so the byte counts below are about this set alone
+rm -f /t/flaky.count; FLAKY=0 run push.sh >/dev/null 2>&1
+run set-conf.sh PUSH_BWLIMIT_KBPS 1000 >/dev/null; run set-conf.sh PUSH_LOG_EVERY_S 1 >/dev/null
+newset 2026-10-30_0232 8000000
+ERP_KIT_TEST_RSH=/t/drop-ssh DROP_AT=1 run push.sh > /t/p7.log 2>&1; RC=$?
+check "push OK after a drop mid-archive" bash -c "[ $RC = 0 ] && [ \"$(st result)\" = OK ]"
+check "the drop is logged with how much had moved" grep -qE 'try 1 of encrypted archives \(1/4\) broke after moving [1-9][0-9]* MB: rc=' /t/p7.log
+check "a try that made progress does not use up the step's tries" bash -c "grep -q 'resuming in 30 s' /t/p7.log && ! grep -q 'giving up' /t/p7.log"
+check "resumed with --append-verify: about 10 MB sent (8 MB archive once + 2 MB standby), not 13" bash -c "[ \"$(st bytes_sent)\" -lt 11500000 ]"
+check "the archive on the peer is byte-identical" cmp "$A/erp-backup/own/daily/2026-10-30_0232/x-database.sql.gz.age" "$J/daily/2026-10-30_0232/x-database.sql.gz.age"
+check "throughput is logged while it runs" grep -qE '\[alpha/push\] encrypted archives \(1/4\): .*/s' /t/p7.log
+
+echo "== relayed link: nothing moves at all"
+cat > /t/hang-ssh <<'EOF'
+#!/bin/bash
+sleep 600
+EOF
+chmod +x /t/hang-ssh; run set-conf.sh PUSH_STALL_S 3 >/dev/null
+newset 2026-10-31_0232
+ERP_KIT_TEST_RSH=/t/hang-ssh run push.sh > /t/p8.log 2>&1; RC=$?
+pkill -f /t/hang-ssh   # their "sleep 600" children stay behind ON PURPOSE, as a broken ProxyCommand can on a box
+check "a stalled link ends FAIL" bash -c "[ $RC != 0 ] && [ \"$(st result)\" = FAIL ]"
+check "the reason says stalled" bash -c "sed -n 's/^msg=//p' $A/erp-backup/state/push.env | grep -q 'stalled: no data moved for 3 s'"
+run set-conf.sh PUSH_STALL_S 900 >/dev/null
+
+check "a child left behind by a broken connection does not hold the push lock" bash -c "pgrep -f 'sleep 600' >/dev/null && ( exec 8>>$A/erp-backup/.push.lock; flock -n 8 )"
+
+echo "== relayed link: the deadline passes"
+# send what earlier (deliberately failed) cases left waiting, so the byte counts below are about this set alone
+rm -f /t/flaky.count; FLAKY=0 run push.sh >/dev/null 2>&1
+run set-conf.sh PUSH_BWLIMIT_KBPS 300 >/dev/null
+newset 2026-11-01_0232 8000000; rm -f /t/drop.count
+PUSH_DEADLINE_S=8 ERP_KIT_TEST_RSH=/t/drop-ssh DROP_AT=99 run push.sh > /t/p9.log 2>&1; RC=$?
+check "deadline: push ends FAIL" bash -c "[ $RC != 0 ] && [ \"$(st result)\" = FAIL ]"
+check "deadline: the FAIL says so, with what was sent" bash -c "sed -n 's/^msg=//p' $A/erp-backup/state/push.env | grep -qE 'did not finish within 0 min 8 s .*stopped during encrypted archives \(1/4\); [0-9]+ MB sent'"
+check "deadline: PUSH_STALE_OR_FAILED raised" bash -c "ERP_KIT_HOSTNAME=boxa bash $A/erp-backup/bin/report.sh >/dev/null 2>&1; python3 -c \"import json,sys; d=json.load(open('$A/erp-backup/status.json')); sys.exit(0 if any(a['code']=='PUSH_STALE_OR_FAILED' and 'did not finish' in a['message'] for a in d['alerts']) else 1)\""
+sleep 3   # the far side notices the cut connection a moment later, then keeps what it has
+PART=$(stat -c %s "$J/daily/2026-11-01_0232/x-database.sql.gz.age" 2>/dev/null || echo 0)
+check "deadline: the part that arrived is kept on the peer" [ "$PART" -gt 0 ]
+run set-conf.sh PUSH_BWLIMIT_KBPS 0 >/dev/null
+ERP_KIT_TEST_RSH=/t/drop-ssh DROP_AT=99 run push.sh > /t/p10.log 2>&1
+check "the next push finishes it" bash -c "[ \"$(st result)\" = OK ] && cmp $A/erp-backup/own/daily/2026-11-01_0232/x-database.sql.gz.age $J/daily/2026-11-01_0232/x-database.sql.gz.age"
+check "and sends only the rest of the archive" bash -c "[ \"$(st bytes_sent)\" -lt $(( 8000000 - PART + 3000000 )) ]"
+
 echo; echo "push-retry: $PASS passed, ${#FAILS[@]} failed"
 [ "${#FAILS[@]}" = 0 ] || { printf '  - %s\n' "${FAILS[@]}"; tail -n 30 "$A/erp-backup/status.log"; exit 1; }
+pkill -f "sleep 600" 2>/dev/null || true
