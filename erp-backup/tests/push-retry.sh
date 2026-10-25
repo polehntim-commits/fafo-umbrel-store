@@ -174,6 +174,57 @@ ERP_KIT_TEST_RSH=/t/drop-ssh DROP_AT=99 run push.sh > /t/p10.log 2>&1
 check "the next push finishes it" bash -c "[ \"$(st result)\" = OK ] && cmp $A/erp-backup/own/daily/2026-11-01_0232/x-database.sql.gz.age $J/daily/2026-11-01_0232/x-database.sql.gz.age"
 check "and sends only the rest of the archive" bash -c "[ \"$(st bytes_sent)\" -lt $(( 8000000 - PART + 3000000 )) ]"
 
+echo "== path warm-up: Tailscale starts on DERP and goes direct after a few pings (OML 2026-10-25: the 4th)"
+# stand-in tailscale CLI: FAKE_TS_DERP_PONGS pongs via DERP(sea), then direct; "status" reports what it last saw
+cat > /t/fake-ts <<'EOF'
+#!/bin/bash
+cmd=$1; shift
+case "$cmd" in
+  ping)
+    d=$(cat /t/ts.derp 2>/dev/null || echo "${FAKE_TS_DERP_PONGS:-3}"); echo "$*" >> /t/ts.pings
+    for i in $(seq 1 60); do
+      if [ "$d" -le 0 ]; then echo "pong from umbrel (100.64.0.9) via 203.0.113.10:41760 in 40ms"; echo 0 > /t/ts.derp; exit 0; fi
+      echo "pong from umbrel (100.64.0.9) via DERP(sea) in 38ms"; d=$((d - 1)); echo "$d" > /t/ts.derp; sleep 0.5
+    done
+    echo "direct connection not established"; exit 1 ;;
+  status)
+    c=""; [ "$(cat /t/ts.derp 2>/dev/null || echo 1)" = 0 ] && c=203.0.113.10:41760
+    printf '{"TUN":false,"Peer":{"k":{"HostName":"umbrel","DNSName":"umbrel.tail.ts.net.","TailscaleIPs":["boxb.example"],"Online":true,"CurAddr":"%s","Relay":"sea"}}}\n' "$c" ;;
+esac
+EOF
+chmod +x /t/fake-ts; export ERP_KIT_TEST_TS=/t/fake-ts
+lk() { sed -n "s/^$1=//p" "$A/erp-backup/state/link.env" 2>/dev/null | tail -n1; }
+rm -f /t/flaky.count; FLAKY=0 run push.sh >/dev/null 2>&1   # send what earlier cases left waiting
+newset 2026-11-02_0232; rm -f /t/flaky.count /t/ts.derp /t/ts.pings
+FAKE_TS_DERP_PONGS=3 FLAKY=0 run push.sh > /t/p11.log 2>&1
+check "warm-up pings with --until-direct" grep -q -- '--until-direct' /t/ts.pings
+check "the push starts direct, and says after how long" grep -qE 'path to beta: direct 203\.0\.113\.10:41760 40 ms, direct after [0-9]+ s' /t/p11.log
+check "the first warm-up needed 3 pings via DERP, then went direct" bash -c "[ \"$(grep -c -- '--until-direct' /t/ts.pings)\" -ge 1 ] && [ \"$(cat /t/ts.derp)\" = 0 ]"
+check "link state ends direct" bash -c "[ \"$(lk warm)\" = direct ] && [ \"$(lk path)\" = direct ]"
+check "OK line carries the path" bash -c "grep 'OK push 2026-11-02_0232' $A/erp-backup/status.log | grep -q 'path=direct 203.0.113.10:41760'"
+run report.sh >/dev/null 2>&1
+check "no LINK_RELAYED once the path forms" python3 -c "import json,sys; d=json.load(open('$A/erp-backup/status.json')); sys.exit(1 if any(a['code']=='LINK_RELAYED' for a in d['alerts']) else 0)"
+
+echo "== path warm-up: no direct path forms (bounded)"
+run set-conf.sh PUSH_WARM_S 3 >/dev/null
+newset 2026-11-03_0232; rm -f /t/ts.derp
+T0=$SECONDS; FAKE_TS_DERP_PONGS=999 FLAKY=0 run push.sh > /t/p12.log 2>&1; RC=$?
+check "the push still goes (over the relay)" bash -c "[ $RC = 0 ] && [ \"$(st result)\" = OK ]"
+check "it says still DERP, and the warm-up stopped at PUSH_WARM_S (3 s)" grep -qE 'path to beta: derp sea 38 ms, still DERP after [34] s' /t/p12.log
+run report.sh >/dev/null 2>&1
+check "LINK_RELAYED says it stayed relayed after the warm-up" python3 -c "import json,sys; d=json.load(open('$A/erp-backup/status.json')); sys.exit(0 if any(a['code']=='LINK_RELAYED' and 'still relayed after a' in a['message'] for a in d['alerts']) else 1)"
+
+echo "== slow transfer: the path is checked again while it runs"
+run set-conf.sh PUSH_BWLIMIT_KBPS 300 >/dev/null; run set-conf.sh PUSH_RECHECK_S 2 >/dev/null; run set-conf.sh PUSH_SLOW_KBPS 100000 >/dev/null
+newset 2026-11-04_0232 3000000; echo 2 > /t/ts.derp
+FAKE_TS_DERP_PONGS=999 FLAKY=0 run push.sh > /t/p13.log 2>&1; RC=$?
+check "slow push still OK" [ "$RC" = 0 ]
+check "mid-transfer path check logged" grep -qE 'encrypted archives \(1/4\): [0-9]+ KB/s, below 100000 KB/s - path check: ' /t/p13.log
+check "and noted in status.log" grep -q 'WARN push 2026-11-04_0232 slow (encrypted archives (1/4))' "$A/erp-backup/status.log"
+check "no path checker left running" bash -c "! pgrep -f '[b]in/push.sh' >/dev/null"
+run set-conf.sh PUSH_BWLIMIT_KBPS 0 >/dev/null; run set-conf.sh PUSH_SLOW_KBPS 400 >/dev/null; run set-conf.sh PUSH_RECHECK_S 300 >/dev/null; run set-conf.sh PUSH_WARM_S 30 >/dev/null
+unset ERP_KIT_TEST_TS
+
 echo; echo "push-retry: $PASS passed, ${#FAILS[@]} failed"
 [ "${#FAILS[@]}" = 0 ] || { printf '  - %s\n' "${FAILS[@]}"; tail -n 30 "$A/erp-backup/status.log"; exit 1; }
 pkill -f "sleep 600" 2>/dev/null || true

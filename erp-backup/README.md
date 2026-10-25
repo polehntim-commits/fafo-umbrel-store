@@ -172,28 +172,40 @@ built for that:
   by a broken connection used to hold it, and the next push waited for "another push".
 - `PUSH_BWLIMIT_KBPS` caps a push when the same path has to carry something else, e.g. an image copy.
 
-#### Getting a direct path (check only; the kit changes no Tailscale setting)
+#### Warming the path to direct (2026-10-24.1)
 
-Read-only, on each box (the Tailscale container is normally `tailscale_web_1`):
+Tailscale starts a fresh or idle peer on DERP and moves it to a direct path after a few disco pings. It falls back to
+DERP after the link has been idle a while. OML and umbrel.local both have easy NAT (`MappingVariesByDestIP: false`,
+UPnP), and a direct path forms within seconds. On 2026-10-25 `tailscale ping` gave 3 pongs via DERP(sea), then the
+4th direct via 203.0.113.10:41760 in 40 ms. So no router or Tailscale change is needed.
 
-    sudo docker exec tailscale_web_1 tailscale netcheck
-    sudo docker exec tailscale_web_1 tailscale ping -c 5 <peer tailnet IP>
-    sudo docker exec tailscale_web_1 tailscale status
+Kits .3-.5 measured with 3 pings, which always landed on the relay, and a push began on whatever path was there.
 
-- `ping` answers `via DERP(sea)` on a relay, and `via <public ip>:<port>` on a direct path.
-- In `netcheck`, compare the two boxes:
-  - `UDP: false`: UDP is blocked outbound. Direct is impossible from that box.
-  - `MappingVariesByDestIP: true`: "hard" (symmetric) NAT. When BOTH boxes have it, they stay on DERP.
-  - `PortMapping:` names UPnP, NAT-PMP or PCP if the router offers one, so Tailscale can open a port by itself.
-    Empty means it cannot.
-  - `Nearest DERP` and the IPv4 / IPv6 lines: a box with working IPv6 on both ends often goes direct over IPv6.
-- On the router at the box that shows hard NAT or no port mapping:
-  - enable UPnP or NAT-PMP; or
-  - forward UDP 41641 to that box (Tailscale's default port; check that tailscaled uses it);
-  - allow outbound UDP.
-- An ISP's carrier-grade NAT (a WAN address in 100.64.0.0/10 on the router) also blocks the forward. It then needs
-  the ISP, or IPv6.
-- Userspace networking (`tun=no`) does not stop a direct path.
+Now `link_probe` runs `tailscale ping --until-direct` first, until a pong comes direct and for at most `PUSH_WARM_S`
+(30 s). It only sends pings and changes nothing. This runs:
+
+- before every push, so the transfer starts direct;
+- before every retry;
+- in `link-test.sh` and the daily watchdog, so `LINK_RELAYED` means the path stayed relayed after a warm-up. Its
+  message then says so.
+
+While a big step runs, a background check looks every `PUSH_RECHECK_S` (300 s). If the step moves less than
+`PUSH_SLOW_KBPS` (400 KB/s), it warms again and logs, e.g.:
+
+    encrypted archives (1/4): 112 KB/s, below 400 KB/s - path check: direct 203.0.113.10:41760 40 ms, direct after 4 s
+
+The transfer is never restarted for this. Tailscale moves the running connection onto the direct path. The
+progress-based timeouts and the resume above still cover a connection that breaks when the path changes.
+
+If a direct path ever stops forming, these show why (read-only, in the Tailscale container):
+
+- `tailscale netcheck`:
+  - `UDP: false` means outbound UDP is blocked.
+  - `MappingVariesByDestIP: true` on both boxes means hard NAT at both ends.
+  - An empty `PortMapping` means the router offers no UPnP or NAT-PMP.
+- `tailscale ping -c 10 <peer>` answers `via DERP(...)` on the relay, and `via ip:port` when direct.
+- OML's WAN is the ISP's carrier-grade NAT (NAT-PMP returned a 100.64.x.x address). A port forward on that router could not
+  help; it is not needed while umbrel.local's side is easy.
 
 ### Kits 2026-10-19.3 to .5: every push over ssh stopped before it started
 

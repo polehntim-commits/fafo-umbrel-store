@@ -182,6 +182,11 @@ addconf PUSH_RESUME_MAX_PER_DAY 6
 addconf PUSH_STALL_S 900
 addconf PUSH_DEADLINE_MIN 660
 addconf PUSH_LOG_EVERY_S 600
+# a fresh or idle Tailscale peer starts on DERP and goes direct after a few pings: warm it up before measuring / pushing,
+# and check again while a push runs below PUSH_SLOW_KBPS (every PUSH_RECHECK_S)
+addconf PUSH_WARM_S 30
+addconf PUSH_SLOW_KBPS 400
+addconf PUSH_RECHECK_S 300
 addconf LINK_MIN_RATE_KBPS 1000
 addconf PUSH_TRANSPORT ssh
 addconf PEER_LOCAL_DIR '""'
@@ -405,17 +410,31 @@ peer_banner() { # first line the peer's sshd sends, via the same path SSH will u
 }
 peer_reachable() { peer_banner | grep -q '^SSH-'; }
 link_desc() { echo "mode=$(link_mode) ts_container=$(find_ts_container || true)${TS_SOCKET:+ socket=$TS_SOCKET}"; }
-# link_probe: how packets to the peer travel (2026-10-19.3). Prints k=v lines: path=direct|derp|unknown derp=<region>
-# endpoint=<ip:port> ping_ms tun=yes|no (no = userspace networking / netstack) online. Read-only; ~10 s.
-link_probe() {
-  local mode c st pg tsx=()
+# ts_cmd : TSX = the tailscale CLI on the push's own path (the Tailscale container, or the host's tailscale). Returns 1
+# when there is none. ERP_KIT_TEST_TS: tests only, a stand-in CLI.
+ts_cmd() {
+  local mode c
+  if [ -n "${ERP_KIT_TEST_TS:-}" ]; then TSX=("$ERP_KIT_TEST_TS"); return 0; fi
   mode=$(link_mode)
-  if [ "$mode" = container ]; then c=$(find_ts_container); [ -n "$c" ] || { echo "path=unknown"; return 0; }; tsx=(docker exec "$c" tailscale ${TS_SOCKET:+--socket=$TS_SOCKET})
-  elif [ "$mode" = direct ] && command -v tailscale >/dev/null; then tsx=(tailscale)
-  else echo "path=unknown"; return 0; fi
-  st=$(timeout 20 "${tsx[@]}" status --json 2>/dev/null || true)
-  pg=$(timeout 30 "${tsx[@]}" ping -c 3 --timeout 5s "$PEER_HOST" 2>&1 | tail -n 3 || true)
-  ERPB_PEER_HOST="$PEER_HOST" python3 - "$st" "$pg" <<'PY'
+  if [ "$mode" = container ]; then c=$(find_ts_container); [ -n "$c" ] || return 1; TSX=(docker exec "$c" tailscale ${TS_SOCKET:+--socket=$TS_SOCKET}); return 0; fi
+  if [ "$mode" = direct ] && command -v tailscale >/dev/null; then TSX=(tailscale); return 0; fi
+  return 1
+}
+# link_probe [WARM_S]: how packets to the peer travel. Prints k=v lines (values without spaces):
+#   path=direct|derp|unknown  derp=<region>  endpoint=<ip:port>  ping_ms  tun=yes|no (no = userspace networking)
+#   online  warm=direct|derp|none  warm_s=<s until direct, or spent>  derp_pongs=<pongs via DERP before direct>
+# WARM-UP (2026-10-24.1): a fresh or idle peer starts on DERP. Tailscale's disco pings then set up the direct path
+# (OML 2026-10-25: 3 pongs via DERP(sea), the 4th direct via 203.0.113.10:41760 in 40 ms). Kits .3-.5 sent 3 pings
+# and so always measured DERP. Now "tailscale ping --until-direct" runs until a pong comes direct, at most
+# WARM_S (PUSH_WARM_S, 30 s). It only sends pings: no setting changes. Read-only.
+link_probe() {
+  local warm="${1:-${PUSH_WARM_S:-30}}" st pg t0 TSX=()
+  ts_cmd || { echo "path=unknown"; return 0; }
+  t0=$SECONDS
+  [ "$warm" -gt 0 ] 2>/dev/null || warm=6
+  pg=$(timeout "$warm" "${TSX[@]}" ping --until-direct -c 60 --timeout 2s "$PEER_HOST" 2>&1 || true)
+  st=$(timeout 20 "${TSX[@]}" status --json 2>/dev/null || true)
+  ERPB_PEER_HOST="$PEER_HOST" ERPB_WARM_S="$(( SECONDS - t0 ))" python3 - "$st" "$pg" <<'PY'
 import json, os, re, sys
 st, pg, host = sys.argv[1], sys.argv[2], os.environ["ERPB_PEER_HOST"]
 out = {"path": "unknown"}
@@ -429,11 +448,16 @@ try:
             elif p.get("Relay"): out.update(path="derp", derp=p["Relay"])
             break
 except Exception: pass
-m = re.findall(r"via (DERP\(([^)]+)\)|[\[\]0-9a-fA-F.:]+:\d+) in ([\d.]+)ms", pg)
+m = re.findall(r"via (DERP\(([^)]+)\)|[\[\]0-9a-fA-F.:]+:\d+) in ([\d.]+)\s*ms", pg)
 if m:
     v, region, ms = m[-1]; out["ping_ms"] = ms
     if v.startswith("DERP"): out.update(path="derp", derp=region)
     else: out.update(path="direct", endpoint=v)
+    out["warm"] = "derp" if v.startswith("DERP") else "direct"
+    out["derp_pongs"] = sum(1 for x in m if x[0].startswith("DERP"))
+else:
+    out["warm"] = "none"
+out["warm_s"] = os.environ.get("ERPB_WARM_S", "0")
 for k, v in out.items(): print(f"{k}={v}")
 PY
 }
@@ -953,24 +977,43 @@ up() {
   local rc rem mode=(); rem=$(( DEADLINE - $(date +%s) )); [ "$rem" -gt 0 ] || return 124
   [ "${UPMODE:-}" = append ] && mode=(--append-verify)
   prog begin push "$PSTEP" "$PSET" --total "${PTOTAL:-0}"
+  local pw=""; if [ -n "$LPATH" ] && [ "${PTOTAL:-0}" -gt 0 ]; then path_watch 8>&- & pw=$!; fi
   set +e
   # 8>&- : the push lock (fd 8) must not leak into rsync / ssh / the ProxyCommand. A child left behind by a broken
   # connection then held the lock, and the next push waited for "another push" for up to PUSH_WAIT_MIN.
   timeout -s TERM "$rem" rsync -aH --partial "${mode[@]}" --timeout="${PUSH_STALL_S:-900}" --exclude '*.partial' "${BW[@]}" --info=progress2 --stats "${RSYNC_E[@]}" "$@" 2>"$ERRF" 8>&- \
     | ERPB_STATE="$STATE" ERPB_ME="$ME" ERPB_LOG_EVERY="${PUSH_LOG_EVERY_S:-600}" ERPB_LOG_TAG="${LPATH:+path=$LPATH}" ERPB_REPORT="$(dirname "$0")/report.sh" \
       python3 "$(dirname "$0")/progress.py" rsync "$STATSF" 8>&-
-  rc=${PIPESTATUS[0]}; set -e
+  rc=${PIPESTATUS[0]}
+  [ -n "$pw" ] && { kill "$pw" 2>/dev/null; wait "$pw" 2>/dev/null; }
+  set -e
   cat "$ERRF" >&2; return "$rc"
+}
+# path_watch : runs in the background during one rsync call. Every PUSH_RECHECK_S, if the call moves less than
+# PUSH_SLOW_KBPS, it warms the path again and logs what it found. The transfer itself is never touched: Tailscale
+# moves a running connection onto the direct path once there is one.
+path_watch() {
+  local slow=$(( ${PUSH_SLOW_KBPS:-400} * 1024 )) every="${PUSH_RECHECK_S:-300}" r
+  while sleep "$every"; do
+    r=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("rate_bps") or 0))' "$STATE/progress.json" 2>/dev/null || echo 0)
+    [ "$r" -ge "$slow" ] && continue
+    probe_path || true
+    log "$PSTEP: $((r / 1024)) KB/s, below ${PUSH_SLOW_KBPS:-400} KB/s - path check: ${LDESC:-n/a}"
+    status "WARN push $PSET slow ($PSTEP): $((r / 1024)) KB/s, path ${LDESC:-n/a}"
+  done
 }
 # last_call_mb : MB the last rsync call moved before it ended (progress2's counter; also known when it failed)
 last_call_mb() { python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("last_call_bytes", 0)) // 1048576)' "$STATSF" 2>/dev/null || echo 0; }
 sent_mb() { python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("bytes_sent", 0)) // 1048576)' "$STATSF" 2>/dev/null || echo 0; }
-# probe_path : LPATH (direct|derp|unknown) and LDESC ("derp sea 38 ms") from the Tailscale container. Read-only, a few s.
+# probe_path [WARM_S] : warm the path up (link_probe), then LPATH (direct|derp|unknown) and LDESC, e.g.
+# "direct 203.0.113.10:41760 40 ms, direct after 6 s" or "derp sea 38 ms, still DERP after 30 s". Read-only.
 probe_path() {
-  [ "${PUSH_TRANSPORT:-ssh}" = ssh ] && [ -z "${ERP_KIT_TEST_RSH:-}" ] || return 0
-  local lp; lp=$(link_probe 2>/dev/null || true)
+  local TSX=(); [ "${PUSH_TRANSPORT:-ssh}" = ssh ] && ts_cmd || return 0
+  local lp w ws; lp=$(link_probe "${1:-}" 2>/dev/null || true)
   LPATH=$(sed -n 's/^path=//p' <<<"$lp"); LPATH="${LPATH:-unknown}"
+  w=$(sed -n 's/^warm=//p' <<<"$lp"); ws=$(sed -n 's/^warm_s=//p' <<<"$lp")
   LDESC="$LPATH$(sed -n 's/^derp=/ /p; s/^endpoint=/ /p' <<<"$lp")$(sed -n 's/^ping_ms=\(.*\)/ \1 ms/p' <<<"$lp")"
+  case "$w" in direct) LDESC="$LDESC, direct after ${ws} s";; derp) LDESC="$LDESC, still DERP after ${ws} s";; none) LDESC="$LDESC, no pong in ${ws} s";; esac
   # shellcheck disable=SC2046
   state_put link at="$(date -Is)" $(tr '\n' ' ' <<<"$lp") last_push_rate_kbps="$(state_get push rate_kbps)"
   return 0
@@ -1098,7 +1141,7 @@ if [ -n "$SB" ]; then
 fi
 inflight "done"; PSTEP="finish"; PTOTAL=0; try_up "$BASE/own/receipts" "$(peer_dest)" || true
 DUR=$((SECONDS - T0))
-probe_path   # the path at the end too: it can change during a long push
+probe_path 6   # the path at the end too (it can change during a long push); the link is warm by now
 read -r SENT XFER <<<"$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("bytes_sent",0), d.get("transferred_file_bytes",0))' "$STATSF" 2>/dev/null || echo "0 0")"
 RATE=0; [ "$DUR" -gt 0 ] && RATE=$(( SENT / DUR / 1024 ))
 prog end OK "$((SENT / 1048576)) MB sent in ${DUR}s (${RATE} KB/s)"
@@ -1626,8 +1669,8 @@ else die "unexpected answer from $PEER_NAME: $OUT"; fi
 echo "--- path to $PEER_NAME (tailscale status / ping)"
 LP=$(link_probe); echo "$LP" | sed 's/^/  /'
 case "$(sed -n 's/^path=//p' <<<"$LP")" in
-  direct) echo "PASS path: direct ($(sed -n 's/^endpoint=//p' <<<"$LP"))" ;;
-  derp)   echo "WARN path: relayed through DERP $(sed -n 's/^derp=//p' <<<"$LP") - pushes run at relay speed (~1 Mbit/s); see the deploy notes for getting a direct path" ;;
+  direct) echo "PASS path: direct ($(sed -n 's/^endpoint=//p' <<<"$LP"); after $(sed -n 's/^derp_pongs=//p' <<<"$LP") pong(s) via DERP, $(sed -n 's/^warm_s=//p' <<<"$LP") s)" ;;
+  derp)   echo "WARN path: still relayed through DERP $(sed -n 's/^derp=//p' <<<"$LP") after $(sed -n 's/^warm_s=//p' <<<"$LP") s of pings - pushes run at relay speed (~1 Mbit/s); see README 'Getting a direct path'" ;;
   *)      echo "WARN path: unknown (could not read tailscale status)" ;;
 esac
 [ "$(sed -n 's/^tun=//p' <<<"$LP")" = no ] && echo "NOTE tailscaled runs with userspace networking (netstack): fine for tens of Mbit/s, not the cause of a ~1 Mbit/s push"
@@ -2459,7 +2502,7 @@ if E["ERPB_RECV"] == "1" and (st["check"].get("incomplete_newer") or "").strip()
     A("warning", "PEER_SET_INCOMPLETE", f"peer set(s) newer than the newest complete one never finished: {st['check'].get('incomplete_newer')}")
 lk = st["link"]
 if E["ERPB_SEND"] == "1" and lk.get("path") == "derp":
-    A("warning", "LINK_RELAYED", f"pushes to the peer go through Tailscale's DERP relay ({lk.get('derp')}), not a direct path - expect about 1 Mbit/s; " + (f"last push {st['push']['rate_kbps']} KB/s" if st['push'].get('rate_kbps') else "no push measured yet (kit 2026-10-19.3+ measures it)"))
+    A("warning", "LINK_RELAYED", f"pushes to the peer go through Tailscale's DERP relay ({lk.get('derp')}), not a direct path" + (f" - still relayed after a {lk.get('warm_s')} s warm-up" if lk.get("warm") == "derp" else "") + " - expect about 1 Mbit/s; " + (f"last push {st['push']['rate_kbps']} KB/s" if st['push'].get('rate_kbps') else "no push measured yet (kit 2026-10-19.3+ measures it)"))
 elif E["ERPB_SEND"] == "1" and st["push"].get("rate_kbps", "").isdigit() and int(st["push"]["rate_kbps"]) < int(E.get("ERPB_LINKMIN") or 1000) and int(st["push"].get("bytes_sent") or 0) > 50 * 1048576:
     A("warning", "LINK_SLOW", f"last push ran at {st['push']['rate_kbps']} KB/s ({lk.get('path') or 'path unknown'}{', userspace networking' if lk.get('tun') == 'no' else ''})")
 sr = st["standby_run"]
