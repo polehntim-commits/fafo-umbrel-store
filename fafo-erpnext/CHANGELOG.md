@@ -1,5 +1,39 @@
 # Changelog — fafo-erpnext
 
+## farm_i9 and farm_precision_ag are private (2026-10-26)
+
+Both repos went private, and the v0.341.0 build stopped at the
+unauthenticated `ADD https://api.github.com/.../farm_precision_ag/commits/main`
+(404). The version gate held, so nothing was pushed. Both apps now use the
+erpnext_mcp recipe and the same BuildKit secret (`gh_token`). The token needs
+Contents: Read-only on erpnext_mcp, farm_i9 and farm_precision_ag.
+
+* The ADD cache-busters are replaced by an authenticated `curl` that keeps
+  only the head sha (`/tmp/.<app>_head.json`).
+* The clone is a plain `git clone ... --depth 1 --origin upstream`, with the
+  token as a one-command `http.extraheader`. Remotes are reset to the plain
+  URL, docs/tests are stripped, and the app is installed with
+  `pip install -e --no-deps`, import-checked and added to `sites/apps.txt`.
+* `bench get-app` is no longer used for these two apps. Its own install step
+  had failed on every build, and the old `|| echo` hid it: each app's
+  requirements.txt lists `frappe`, and uv cannot re-resolve Frappe's
+  git-pinned pypika.
+* No `|| echo` fallbacks. A failed clone, install or import fails the build.
+  So does finding the token, raw or base64, under the app, `sites/` or
+  `logs/`. A final check after erpnext_mcp also covers `/tmp`, `/root` and
+  the git configs.
+* `umbrel-app.yml` no longer links the two repos; they 404 for the public.
+* The public agriculture and hrms fetches are unchanged.
+
+Tested in `frappe/erpnext:v15.123.0`, with the two clone steps and the final
+check copied verbatim from this Dockerfile, a fake token, and git pointed at
+local copies:
+* Both apps install and import, appear in apps.txt, keep the plain upstream
+  URL and carry no extraheader.
+* Three negative controls each fail the build: the token found in the tree,
+  no secret passed, and GitHub refusing the clone.
+* `docker build --check` is clean.
+
 ## Base image v15.123.0 (2026-10-18)
 
 Security bump of the framework underneath every app in the image. No change
