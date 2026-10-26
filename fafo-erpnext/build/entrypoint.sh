@@ -51,7 +51,7 @@
 #      each site's grant to the host-independent `user@'%'` using the
 #      root credentials compose already supplies, so the next IP
 #      change is a non-event. The incident that motivated it hit
-#      Tim's mom's Umbrel on 2026-07-26 after the v0.4.0 MCP deploy.
+#      a production Umbrel on 2026-07-26 after the v0.4.0 MCP deploy.
 #
 # Combined: any single cache clear, asset delete, partial migration,
 # or container-IP reassignment recovers automatically on the next
@@ -412,7 +412,7 @@ asset_floor_check "pre-app-reconcile"
 #   1. `FRAPPE_SITE_NAME_HEADER="frontend"` in supervisord.conf, which
 #      makes nginx send `X-Frappe-Site-Name: frontend` on every proxied
 #      request regardless of the Host header. This is what already makes
-#      bare-IP access work — verified: `Host: 100.69.162.122`,
+#      bare-IP access work — verified: `Host: <tailnet-ip>`,
 #      `Host: umbrel.local:5300` and `Host: totally-bogus.example` all
 #      return HTTP 200 from /api/method/ping.
 #   2. `default_site` in common_site_config.json — this block.

@@ -7,7 +7,7 @@ The problem this fixes
 `bench new-site` creates the site's MariaDB user with a grant pinned to the
 *current container IP*::
 
-    CREATE USER '_5e5899d8398b5f7b'@'10.21.0.27' IDENTIFIED BY '…'
+    CREATE USER '_0123456789abcdef'@'10.21.0.27' IDENTIFIED BY '…'
 
 Docker hands out container IPs from the bridge pool on a first-come basis, so
 any container recreate (an app update, an Umbrel reboot, a compose edit) can
@@ -15,10 +15,10 @@ bring the server container up on a different address. The grant no longer
 matches the connecting host and *every* request 500s with::
 
     pymysql.err.OperationalError: (1045, "Access denied for user
-    '_5e5899d8398b5f7b'@'10.21.0.24' (using password: YES)")
+    '_0123456789abcdef'@'10.21.0.24' (using password: YES)")
 
 This is host drift, not password drift — `sites/<site>/site_config.json` still
-holds the correct `db_password`. It bit Tim's mom's Umbrel on 2026-07-26 after
+holds the correct `db_password`. It bit a production Umbrel on 2026-07-26 after
 the v0.4.0 ERPNext MCP deploy.
 
 Why not `bench`

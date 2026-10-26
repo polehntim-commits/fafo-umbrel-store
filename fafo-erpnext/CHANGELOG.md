@@ -186,7 +186,7 @@ being precise about what it does:
   `FRAPPE_SITE_NAME_HEADER="frontend"`, so nginx sends
   `X-Frappe-Site-Name: frontend` on every proxied request and Frappe never
   consults the Host header or `default_site` for web traffic. Verified: with
-  `Host: 100.69.162.122`, `Host: umbrel.local:5300`, `Host: frontend` and
+  `Host: <tailnet-ip>`, `Host: umbrel.local:5300`, `Host: frontend` and
   `Host: totally-bogus.example`, `/api/method/ping` returns HTTP 200 in all
   four cases.
 - `bench new-site --set-default` already writes it on first boot, so on a
@@ -210,7 +210,7 @@ documented **ships-inert** behavior. `authorize()` raises
 cannot tell "disabled" from "does not exist".
 
 Reproduced exactly, and confirmed independent of the Host header — the same
-`-32600 not found` comes back for `Host: 100.69.162.122`, `Host: frontend` and
+`-32600 not found` comes back for `Host: <tailnet-ip>`, `Host: frontend` and
 `Host: umbrel.local:5300` alike. After enabling the endpoint and generating a
 token at `/app/erpnext-mcp-settings`, a full `initialize` handshake succeeds
 over a bare-IP Host.
@@ -233,13 +233,13 @@ MCP handler as nothing at all — observed here as a 401 from
 
   ```
   pymysql.err.OperationalError: (1045, "Access denied for user
-  '_5e5899d8398b5f7b'@'10.21.0.24' (using password: YES)")
+  '_0123456789abcdef'@'10.21.0.24' (using password: YES)")
   ```
 
   This is **host** drift, not password drift — `sites/frontend/site_config.json`
   still held the correct `db_password`. `bench new-site` creates the site's
   MariaDB user pinned to whatever IP the server container happened to have at
-  creation time (`'_5e5899d8398b5f7b'@'10.21.0.27'`). Docker allocates bridge
+  creation time (`'_0123456789abcdef'@'10.21.0.27'`). Docker allocates bridge
   IPs on a first-come basis, so any recreate — an app update, an Umbrel reboot,
   a compose edit — can bring the container up on a different address, and from
   that moment no grant matches the connecting host.

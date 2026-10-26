@@ -195,7 +195,7 @@ Symptom: every request returns 500. The container log shows
 
 ```
 pymysql.err.OperationalError: (1045, "Access denied for user
-'_5e5899d8398b5f7b'@'10.21.0.24' (using password: YES)")
+'_0123456789abcdef'@'10.21.0.24' (using password: YES)")
 ```
 
 Cause: `bench new-site` pinned the site's MariaDB user to the container's IP

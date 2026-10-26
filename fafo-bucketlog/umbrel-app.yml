@@ -19,7 +19,9 @@ port: 5200
 gallery: []
 path: ""
 defaultUsername: ""
-defaultPassword: "changeme"
+# No app password: the dashboard sits behind Umbrel's own login (app_proxy),
+# and the API uses the per-install $APP_SEED key. "changeme" was never used.
+defaultPassword: ""
 developer: Tim Polehn
 submitter: Tim Polehn
 submission: https://github.com/polehntim-commits/fafo-umbrel-store
