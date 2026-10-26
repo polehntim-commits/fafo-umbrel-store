@@ -44,7 +44,7 @@ description: >-
 website: "https://frappe.io/erpnext"
 dependencies: []
 repo: >-
-  https://github.com/frappe/erpnext,https://github.com/frappe/agriculture,https://github.com/frappe/hrms,https://github.com/polehntim-commits/farm_i9,https://github.com/polehntim-commits/farm_precision_ag,https://github.com/polehntim-commits/erpnext_mcp
+  https://github.com/frappe/erpnext,https://github.com/frappe/agriculture,https://github.com/frappe/hrms,https://github.com/polehntim-commits/farm_i9,https://github.com/polehntim-commits/farm_precision_ag
 support: https://github.com/polehntim-commits/fafo-umbrel-store/issues
 port: 5300
 gallery: []
