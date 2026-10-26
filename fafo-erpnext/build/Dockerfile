@@ -255,17 +255,41 @@ RUN cd /home/frappe/frappe-bench && \
      fi)
 USER root
 
-# ── Cache-bust when polehntim/erpnext_mcp main branch advances ────
-# Same pattern as farm_i9, hrms, farm_precision_ag above.
+# ── erpnext_mcp is a PRIVATE repo: the build needs a read-only token ──
+# Both GitHub calls below authenticate with a fine-grained PAT
+# (Contents: read-only, erpnext_mcp only) passed as a BuildKit SECRET:
 #
-# TWO busters, because the ADD alone is not enough. The ADD keys on
-# the GitHub API response, so it only sees a commit that has been
-# PUSHED — a local-only commit on erpnext_mcp main leaves this layer
-# cached and the image ships the old app. ERPNEXT_MCP_VERSION below
-# is the manual one: it is expanded into the RUN command, so
-# changing it changes the layer key. Comments do NOT work for this;
-# Docker strips them before hashing the instruction.
-ADD https://api.github.com/repos/polehntim-commits/erpnext_mcp/commits/main /tmp/.erpnext_mcp_head.json
+#   cd fafo-erpnext/build
+#   export GH_TOKEN=<fine-grained read-only token>
+#   DOCKER_BUILDKIT=1 docker build --no-cache \
+#       --secret id=gh_token,env=GH_TOKEN \
+#       --build-arg ERPNEXT_MCP_VERSION=<x.y.z> \
+#       -t polehntim/erpnext-umbrel:15 .
+#   docker push polehntim/erpnext-umbrel:15
+#
+# The secret is mounted at /run/secrets/gh_token for one RUN step
+# only. NEVER pass the token as an ARG or ENV: those are recorded in
+# the image config / `docker history` for anyone who can pull it.
+# `required=true` fails the build if the secret is missing, instead of
+# silently shipping an image without erpnext_mcp.
+#
+# ── Build record: the erpnext_mcp commit this image was built from ──
+# deploy_status.py reads /tmp/.erpnext_mcp_head.json ({"sha": ...}).
+# Only the sha is kept — the full API response would bake the last
+# commit's diff into the image. This RUN also acts as the cache-buster
+# for --no-cache builds; ERPNEXT_MCP_VERSION below is the manual one:
+# it is expanded into the RUN command, so changing it changes the
+# layer key. Comments do NOT work for this; Docker strips them before
+# hashing the instruction.
+RUN --mount=type=secret,id=gh_token,required=true \
+    set -eu; \
+    test -s /run/secrets/gh_token || { echo "[dockerfile] gh_token secret is empty — pass --secret id=gh_token,env=GH_TOKEN" >&2; exit 1; }; \
+    curl -sfSL --retry 3 --retry-delay 5 \
+      -H "Authorization: Bearer $(cat /run/secrets/gh_token)" \
+      https://api.github.com/repos/polehntim-commits/erpnext_mcp/commits/main \
+      -o /tmp/.erpnext_mcp_commit.json; \
+    python3 -c 'import json; d = json.load(open("/tmp/.erpnext_mcp_commit.json")); json.dump({"sha": d["sha"], "branch": "main"}, open("/tmp/.erpnext_mcp_head.json", "w"))'; \
+    rm -f /tmp/.erpnext_mcp_commit.json
 ARG ERPNEXT_MCP_VERSION=0.18.0
 
 # ── Bake polehntim/erpnext_mcp into the image ─────────────────────
@@ -285,17 +309,40 @@ ARG ERPNEXT_MCP_VERSION=0.18.0
 # generates a token, ticks Enabled, saves. Until then the endpoint
 # returns 404. Same two-step install (get-app + explicit pip
 # install -e) as sibling apps to guarantee importable at runtime.
+#
+# Private-repo clone, done so the token never reaches the image:
+#   * The token goes to git as an http.extraheader through the
+#     GIT_CONFIG_* environment of this one command — NOT in the clone
+#     URL, which bench would record in apps/erpnext_mcp/.git/config
+#     and logs/bench.log.
+#   * Unlike the sibling apps, a failed get-app or pip install FAILS
+#     THE BUILD. The old `|| echo` fallback would quietly ship an image
+#     with no erpnext_mcp if the token were missing or expired.
+#   * Docs, release notes, the standalone test suite, the changelog
+#     and .git are removed IN THE SAME RUN (a later RUN cannot remove
+#     files from an earlier layer). The app never reads them at
+#     runtime; deploy_status.py takes the commit from the build record
+#     above when .git is absent.
+#   * The last step fails the build if the token (raw or base64) is
+#     found anywhere under apps/erpnext_mcp, sites/ or logs/.
 USER frappe
-RUN cd /home/frappe/frappe-bench && \
-    echo "[dockerfile] baking erpnext_mcp target ${ERPNEXT_MCP_VERSION}" && \
-    (bench get-app --branch main erpnext_mcp https://github.com/polehntim-commits/erpnext_mcp.git \
-     || echo "[dockerfile] erpnext_mcp get-app failed at build — will attempt pip install anyway") && \
-    (if [ -d apps/erpnext_mcp ]; then \
-        env/bin/pip install -e apps/erpnext_mcp --force-reinstall --no-deps \
-            || echo "[dockerfile] erpnext_mcp pip install failed — image ships without a runnable erpnext_mcp"; \
-     else \
-        echo "[dockerfile] apps/erpnext_mcp dir missing — nothing to pip install"; \
-     fi)
+RUN --mount=type=secret,id=gh_token,required=true,uid=1000,mode=0400 \
+    set -eu; \
+    cd /home/frappe/frappe-bench; \
+    echo "[dockerfile] baking erpnext_mcp target ${ERPNEXT_MCP_VERSION}"; \
+    tok="$(cat /run/secrets/gh_token)"; \
+    auth="$(printf 'x-access-token:%s' "$tok" | base64 | tr -d '\n')"; \
+    GIT_CONFIG_COUNT=1 \
+    GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+    GIT_CONFIG_VALUE_0="Authorization: Basic ${auth}" \
+      bench get-app --branch main erpnext_mcp https://github.com/polehntim-commits/erpnext_mcp.git; \
+    test -f apps/erpnext_mcp/erpnext_mcp/__init__.py || { echo "[dockerfile] erpnext_mcp get-app left no app at apps/erpnext_mcp — failing the build" >&2; exit 1; }; \
+    rm -rf apps/erpnext_mcp/.git apps/erpnext_mcp/docs apps/erpnext_mcp/RELEASES \
+           apps/erpnext_mcp/tests_standalone apps/erpnext_mcp/CHANGELOG.md; \
+    env/bin/pip install -e apps/erpnext_mcp --force-reinstall --no-deps; \
+    if grep -rqsF -e "$tok" -e "$auth" apps/erpnext_mcp sites logs; then \
+      echo "[dockerfile] the GitHub token was found in the image tree — failing the build" >&2; exit 1; \
+    fi
 USER frappe
 # erpnext_mcp declares these and imports every one of them defensively: without
 # shapely and h3 the six boundary tools go unavailable, without reportlab the two
