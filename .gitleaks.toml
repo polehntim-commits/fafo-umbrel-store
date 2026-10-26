@@ -1,0 +1,36 @@
+# gitleaks config for fafo-umbrel-store — this repo STAYS PUBLIC (Umbrel adds
+# community stores by public git URL), so on top of gitleaks' default secret
+# rules it also blocks the farm's real network identifiers.
+# Values that would themselves leak if written here (the farm's public IPs,
+# family names, account numbers) belong in the PRIVATE deny-list that
+# scripts/secret-scan.sh reads from ~/.config/secret-scan/denylist.txt.
+# Used by scripts/secret-scan.sh and the pre-push hook. See docs/SECRET_SCANNING.md.
+
+title = "fafo-umbrel-store"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "tailnet-hostname"
+description = "Tailscale MagicDNS hostname (*.tailXXXX.ts.net) — use a placeholder such as umbrel.tail1234.ts.net"
+regex = '''\b[a-z0-9-]+\.tail[0-9a-f]{4,}\.ts\.net\b'''
+keywords = [".ts.net"]
+  [[rules.allowlists]]
+  description = "documented placeholders"
+  regexes = ['''\.tail(1234|4a2b|aaaa|bbbb|9999|0000)\.ts\.net''']
+
+[[rules]]
+id = "tailnet-ip"
+description = "Tailscale CGNAT address (100.64.0.0/10) — use <tailnet-ip>. (Non-capturing group on purpose: gitleaks treats a capture group as the secret.)"
+regex = '''\b100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b'''
+keywords = ["100."]
+  [[rules.allowlists]]
+  description = "test fixtures use 100.64.0.x"
+  regexes = ['''\b100\.64\.0\.[0-9]{1,3}\b''']
+
+[[rules]]
+id = "onion-v3-address"
+description = "Tor v3 onion address — a hidden service's address is its secret"
+regex = '''\b[a-z2-7]{56}\.onion\b'''
+keywords = [".onion"]
