@@ -1,5 +1,34 @@
 # Changelog — fafo-erpnext
 
+## Cached builds: the private apps are pinned by commit (2026-11-04)
+
+Builds took 243–317 s because every one ran `--no-cache`. That flag was
+there for a reason: the private apps' head was read by a `RUN` with a
+secret mount, and BuildKit never keys a layer on a secret or a network
+reply, so a cached build would have kept baking an old commit.
+
+* Each private app's commit is now a required build arg —
+  `ERPNEXT_MCP_SHA`, `FARM_I9_SHA`, `FARM_PRECISION_AG_SHA` (full 40-hex),
+  read from GitHub by the deploy command right before the build. The arg
+  is the cache key. The clone must land on exactly that commit, or the
+  build fails (it also catches a push between "read the SHA" and "clone").
+  The `/tmp/.<app>_head.json` build records are written from it.
+* Layers are ordered slowest-and-stable first: apt, agriculture, hrms,
+  the pip set, then one full `bench build --production` for those apps.
+  farm_i9, farm_precision_ag and erpnext_mcp come last, followed by a
+  small `bench build --apps erpnext_mcp,farm_i9,farm_precision_ag
+  --production`. Frappe merges assets.json and relinks every app's assets,
+  so this matches a full build. The private apps have no bundles or
+  translations today.
+* The standard build is cached and has no `--no-cache`. It runs on the
+  existing `colima` (docker-driver) builder with `--provenance=false
+  --sbom=false`, so the image lands in the daemon with no 7 GB tarball
+  export and no attestation manifest. The clean rebuild (`--no-cache
+  --pull`) stays as the monthly or base-image variant. The version gate
+  before push is unchanged.
+* The pip set (shapely, h3, reportlab) is unpinned and now cached. It
+  picks up new releases on the clean rebuild, not on every build.
+
 ## farm_i9 and farm_precision_ag are private (2026-10-26)
 
 Both repos went private, and the v0.341.0 build stopped at the

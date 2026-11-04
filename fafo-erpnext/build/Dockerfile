@@ -158,70 +158,6 @@ RUN cd /home/frappe/frappe-bench && \
      fi)
 USER root
 
-# ── Bake polehntim/farm_i9 into the image ─────────────────────────
-# Custom I-9 employment eligibility workflow app, cloned at build time
-# so the code survives container recreates (Umbrel bind-mounts sites/
-# but not apps/). Explicit `pip install -e` after get-app, because
-# `bench get-app` has a silent-fail pip step.
-#
-# PRIVATE REPO (2026-10-26): read with the same BuildKit secret as
-# erpnext_mcp (see "erpnext_mcp is a PRIVATE repo" below for the build
-# command). The first RUN records the head commit (sha only) at
-# /tmp/.farm_i9_head.json; it replaced an unauthenticated ADD of the
-# commits API, which 404s on a private repo. The image is built with
-# --no-cache, so every layer re-runs; on a cached build, pass
-# --no-cache to pick up new commits. The clone is the erpnext_mcp
-# recipe: the token goes to git as an http.extraheader through this
-# command's GIT_CONFIG_* environment (never in the URL), remotes are
-# reset to the plain URL, docs/tests are stripped, and the build FAILS
-# if the clone, the pip install or the import fails, or the token (raw
-# or base64) is found under apps/farm_i9, sites/ or logs/. No `|| echo`
-# fallback: an image without this app is a failed build.
-# Plain `git clone` (the exact command bench get-app runs) instead of
-# `bench get-app`: get-app's own install step ALWAYS fails here — the
-# app's requirements.txt lists `frappe`, and uv cannot re-resolve
-# Frappe's git-pinned pypika ("URL dependencies must be expressed as
-# direct requirements"). The old `|| echo` hid that on every build;
-# the `pip install --no-deps` below is what has always installed it.
-# The app is added to sites/apps.txt here so `bench build` builds its
-# assets (the entrypoint regenerates apps.txt from apps/ at boot).
-USER root
-RUN --mount=type=secret,id=gh_token,required=true \
-    set -eu; \
-    test -s /run/secrets/gh_token || { echo "[dockerfile] gh_token secret is empty — pass --secret id=gh_token,env=GH_TOKEN" >&2; exit 1; }; \
-    curl -sfSL --retry 3 --retry-delay 5 \
-      -H "Authorization: Bearer $(cat /run/secrets/gh_token)" \
-      https://api.github.com/repos/polehntim-commits/farm_i9/commits/main \
-      -o /tmp/.farm_i9_commit.json; \
-    python3 -c 'import json; d = json.load(open("/tmp/.farm_i9_commit.json")); json.dump({"sha": d["sha"], "branch": "main"}, open("/tmp/.farm_i9_head.json", "w"))'; \
-    rm -f /tmp/.farm_i9_commit.json
-USER frappe
-RUN --mount=type=secret,id=gh_token,required=true,uid=1000,mode=0400 \
-    set -eu; \
-    cd /home/frappe/frappe-bench; \
-    tok="$(cat /run/secrets/gh_token)"; \
-    auth="$(printf 'x-access-token:%s' "$tok" | base64 | tr -d '\n')"; \
-    GIT_CONFIG_COUNT=1 \
-    GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
-    GIT_CONFIG_VALUE_0="Authorization: Basic ${auth}" \
-      git clone https://github.com/polehntim-commits/farm_i9.git --branch main --depth 1 --origin upstream apps/farm_i9; \
-    test -f apps/farm_i9/farm_i9/__init__.py || { echo "[dockerfile] farm_i9 clone left no app at apps/farm_i9 — failing the build" >&2; exit 1; }; \
-    for r in $(git -C apps/farm_i9 remote); do git -C apps/farm_i9 remote set-url "$r" https://github.com/polehntim-commits/farm_i9.git; done; \
-    if git -C apps/farm_i9 config --get-all http.https://github.com/.extraheader >/dev/null; then \
-      git -C apps/farm_i9 config --unset-all http.https://github.com/.extraheader; \
-    fi; \
-    rm -rf apps/farm_i9/docs apps/farm_i9/tests apps/farm_i9/tests_standalone apps/farm_i9/RELEASES apps/farm_i9/CHANGELOG.md; \
-    env/bin/pip install -e apps/farm_i9 --force-reinstall --no-deps; \
-    env/bin/python -c "import farm_i9"; \
-    if ! grep -qxF farm_i9 sites/apps.txt; then \
-      { cat sites/apps.txt; echo; echo farm_i9; } | sed '/^$/d' > sites/apps.txt.new; \
-      mv sites/apps.txt.new sites/apps.txt; \
-    fi; \
-    if grep -rqsF -e "$tok" -e "$auth" apps/farm_i9 sites logs; then \
-      echo "[dockerfile] the GitHub token was found in the image tree after farm_i9 — failing the build" >&2; exit 1; \
-    fi
-USER root
-
 # ── frappe/hrms is pinned to a release tag (2026-10-18) ───────────
 # It used to track the version-15 branch HEAD, which meant the HRMS
 # in the image was whatever HEAD happened to be at build time — not
@@ -256,6 +192,99 @@ RUN cd /home/frappe/frappe-bench && \
      fi)
 USER root
 
+
+# ── FAST BUILD (2026-11-04): the slow, stable layers come first ───
+# Everything above this line changes only when a pin changes: the base
+# image digest, the apt list, agriculture's develop head, HRMS_REF, or
+# the pip set below. Everything after it is Tim's own apps, which
+# change on most builds. With the standard (cached) build, a new
+# erpnext_mcp commit rebuilds only the layers from its clone down;
+# apt, agriculture, hrms and this full asset build come from cache.
+# A clean rebuild (`--no-cache --pull`) is the monthly / base-change
+# variant in the deploy file.
+USER frappe
+# erpnext_mcp declares these and imports every one of them defensively: without
+# shapely and h3 the six boundary tools go unavailable, without reportlab the two
+# tax-form PDF tools do (v0.36.0), and in both cases they say so by name rather
+# than taking the rest of the app down with them. Baked in so the image never
+# ships in that degraded state.
+RUN cd /home/frappe/frappe-bench && \
+    echo "[dockerfile] installing erpnext_mcp dependencies (shapely, h3, reportlab)" && \
+    env/bin/pip install shapely h3 reportlab
+
+# Full production build of the STABLE apps' assets (frappe, erpnext,
+# agriculture, hrms — the apps in apps.txt at this point). Cached until
+# one of them changes. The private apps get their own small build after
+# they are cloned: Frappe's build merges assets.json (it never drops
+# another app's entries) and `--apps` limits the bundle and the
+# translation compile to the named apps, while every app's
+# sites/assets/<app> link is (re)made either way.
+RUN cd /home/frappe/frappe-bench && \
+    (bench build --production || echo "[dockerfile] bench build (stable apps) failed — will retry in entrypoint")
+USER root
+
+# ── Bake polehntim/farm_i9 into the image ─────────────────────────
+# Custom I-9 employment eligibility workflow app, cloned at build time
+# so the code survives container recreates (Umbrel bind-mounts sites/
+# but not apps/). Explicit `pip install -e` after get-app, because
+# `bench get-app` has a silent-fail pip step.
+#
+# PRIVATE REPO (2026-10-26): read with the same BuildKit secret as
+# erpnext_mcp (see "erpnext_mcp is a PRIVATE repo" below for the build
+# command). The commit is the FARM_I9_SHA build arg (2026-11-04: it
+# replaced a RUN that asked the commits API, which a cached build never
+# re-ran); the clone must land on exactly that commit, and the build
+# record /tmp/.farm_i9_head.json (sha only) is written from it. The clone is the erpnext_mcp
+# recipe: the token goes to git as an http.extraheader through this
+# command's GIT_CONFIG_* environment (never in the URL), remotes are
+# reset to the plain URL, docs/tests are stripped, and the build FAILS
+# if the clone, the pip install or the import fails, or the token (raw
+# or base64) is found under apps/farm_i9, sites/ or logs/. No `|| echo`
+# fallback: an image without this app is a failed build.
+# Plain `git clone` (the exact command bench get-app runs) instead of
+# `bench get-app`: get-app's own install step ALWAYS fails here — the
+# app's requirements.txt lists `frappe`, and uv cannot re-resolve
+# Frappe's git-pinned pypika ("URL dependencies must be expressed as
+# direct requirements"). The old `|| echo` hid that on every build;
+# the `pip install --no-deps` below is what has always installed it.
+# The app is added to sites/apps.txt here so `bench build` builds its
+# assets (the entrypoint regenerates apps.txt from apps/ at boot).
+USER root
+# The commit to bake is a BUILD ARG (FARM_I9_SHA, the full 40-hex SHA the deploy command reads from
+# GitHub just before the build). It is what busts this app's cache — and only from here down —
+# when farm_i9 moves; the clone below must land on exactly that commit or the build fails.
+ARG FARM_I9_SHA
+USER frappe
+RUN --mount=type=secret,id=gh_token,required=true,uid=1000,mode=0400 \
+    set -eu; \
+    echo "${FARM_I9_SHA}" | grep -Eqx '[0-9a-f]{40}' || { echo "[dockerfile] pass --build-arg FARM_I9_SHA=<the 40-hex commit of farm_i9 main> — failing the build" >&2; exit 1; }; \
+    cd /home/frappe/frappe-bench; \
+    tok="$(cat /run/secrets/gh_token)"; \
+    auth="$(printf 'x-access-token:%s' "$tok" | base64 | tr -d '\n')"; \
+    GIT_CONFIG_COUNT=1 \
+    GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+    GIT_CONFIG_VALUE_0="Authorization: Basic ${auth}" \
+      git clone https://github.com/polehntim-commits/farm_i9.git --branch main --depth 1 --origin upstream apps/farm_i9; \
+    test -f apps/farm_i9/farm_i9/__init__.py || { echo "[dockerfile] farm_i9 clone left no app at apps/farm_i9 — failing the build" >&2; exit 1; }; \
+    got="$(git -C apps/farm_i9 rev-parse HEAD)"; \
+    [ "$got" = "${FARM_I9_SHA}" ] || { echo "[dockerfile] farm_i9 main is $got, not the FARM_I9_SHA ${FARM_I9_SHA} this build was asked for (pushed mid-build?) — failing the build" >&2; exit 1; }; \
+    printf '{"sha": "%s", "branch": "main"}' "$got" > /tmp/.farm_i9_head.json; \
+    for r in $(git -C apps/farm_i9 remote); do git -C apps/farm_i9 remote set-url "$r" https://github.com/polehntim-commits/farm_i9.git; done; \
+    if git -C apps/farm_i9 config --get-all http.https://github.com/.extraheader >/dev/null; then \
+      git -C apps/farm_i9 config --unset-all http.https://github.com/.extraheader; \
+    fi; \
+    rm -rf apps/farm_i9/docs apps/farm_i9/tests apps/farm_i9/tests_standalone apps/farm_i9/RELEASES apps/farm_i9/CHANGELOG.md; \
+    env/bin/pip install -e apps/farm_i9 --force-reinstall --no-deps; \
+    env/bin/python -c "import farm_i9"; \
+    if ! grep -qxF farm_i9 sites/apps.txt; then \
+      { cat sites/apps.txt; echo; echo farm_i9; } | sed '/^$/d' > sites/apps.txt.new; \
+      mv sites/apps.txt.new sites/apps.txt; \
+    fi; \
+    if grep -rqsF -e "$tok" -e "$auth" apps/farm_i9 sites logs; then \
+      echo "[dockerfile] the GitHub token was found in the image tree after farm_i9 — failing the build" >&2; exit 1; \
+    fi
+USER root
+
 # ── Bake polehntim/farm_precision_ag into the image ──────────────
 # Precision agriculture Frappe app. Phase B (USDA Market Pricing)
 # is the initial feature — Land/Blocks/Implements/Spray/IPM/
@@ -263,11 +292,10 @@ USER root
 #
 # PRIVATE REPO (2026-10-26): read with the same BuildKit secret as
 # erpnext_mcp (see "erpnext_mcp is a PRIVATE repo" below for the build
-# command). The first RUN records the head commit (sha only) at
-# /tmp/.farm_precision_ag_head.json; it replaced an unauthenticated ADD of the
-# commits API, which 404s on a private repo. The image is built with
-# --no-cache, so every layer re-runs; on a cached build, pass
-# --no-cache to pick up new commits. The clone is the erpnext_mcp
+# command). The commit is the FARM_PRECISION_AG_SHA build arg (2026-11-04: it
+# replaced a RUN that asked the commits API, which a cached build never
+# re-ran); the clone must land on exactly that commit, and the build
+# record /tmp/.farm_precision_ag_head.json (sha only) is written from it. The clone is the erpnext_mcp
 # recipe: the token goes to git as an http.extraheader through this
 # command's GIT_CONFIG_* environment (never in the URL), remotes are
 # reset to the plain URL, docs/tests are stripped, and the build FAILS
@@ -283,18 +311,14 @@ USER root
 # The app is added to sites/apps.txt here so `bench build` builds its
 # assets (the entrypoint regenerates apps.txt from apps/ at boot).
 USER root
-RUN --mount=type=secret,id=gh_token,required=true \
-    set -eu; \
-    test -s /run/secrets/gh_token || { echo "[dockerfile] gh_token secret is empty — pass --secret id=gh_token,env=GH_TOKEN" >&2; exit 1; }; \
-    curl -sfSL --retry 3 --retry-delay 5 \
-      -H "Authorization: Bearer $(cat /run/secrets/gh_token)" \
-      https://api.github.com/repos/polehntim-commits/farm_precision_ag/commits/main \
-      -o /tmp/.farm_precision_ag_commit.json; \
-    python3 -c 'import json; d = json.load(open("/tmp/.farm_precision_ag_commit.json")); json.dump({"sha": d["sha"], "branch": "main"}, open("/tmp/.farm_precision_ag_head.json", "w"))'; \
-    rm -f /tmp/.farm_precision_ag_commit.json
+# The commit to bake is a BUILD ARG (FARM_PRECISION_AG_SHA, the full 40-hex SHA the deploy command reads from
+# GitHub just before the build). It is what busts this app's cache — and only from here down —
+# when farm_precision_ag moves; the clone below must land on exactly that commit or the build fails.
+ARG FARM_PRECISION_AG_SHA
 USER frappe
 RUN --mount=type=secret,id=gh_token,required=true,uid=1000,mode=0400 \
     set -eu; \
+    echo "${FARM_PRECISION_AG_SHA}" | grep -Eqx '[0-9a-f]{40}' || { echo "[dockerfile] pass --build-arg FARM_PRECISION_AG_SHA=<the 40-hex commit of farm_precision_ag main> — failing the build" >&2; exit 1; }; \
     cd /home/frappe/frappe-bench; \
     tok="$(cat /run/secrets/gh_token)"; \
     auth="$(printf 'x-access-token:%s' "$tok" | base64 | tr -d '\n')"; \
@@ -303,6 +327,9 @@ RUN --mount=type=secret,id=gh_token,required=true,uid=1000,mode=0400 \
     GIT_CONFIG_VALUE_0="Authorization: Basic ${auth}" \
       git clone https://github.com/polehntim-commits/farm_precision_ag.git --branch main --depth 1 --origin upstream apps/farm_precision_ag; \
     test -f apps/farm_precision_ag/farm_precision_ag/__init__.py || { echo "[dockerfile] farm_precision_ag clone left no app at apps/farm_precision_ag — failing the build" >&2; exit 1; }; \
+    got="$(git -C apps/farm_precision_ag rev-parse HEAD)"; \
+    [ "$got" = "${FARM_PRECISION_AG_SHA}" ] || { echo "[dockerfile] farm_precision_ag main is $got, not the FARM_PRECISION_AG_SHA ${FARM_PRECISION_AG_SHA} this build was asked for (pushed mid-build?) — failing the build" >&2; exit 1; }; \
+    printf '{"sha": "%s", "branch": "main"}' "$got" > /tmp/.farm_precision_ag_head.json; \
     for r in $(git -C apps/farm_precision_ag remote); do git -C apps/farm_precision_ag remote set-url "$r" https://github.com/polehntim-commits/farm_precision_ag.git; done; \
     if git -C apps/farm_precision_ag config --get-all http.https://github.com/.extraheader >/dev/null; then \
       git -C apps/farm_precision_ag config --unset-all http.https://github.com/.extraheader; \
@@ -320,18 +347,25 @@ RUN --mount=type=secret,id=gh_token,required=true,uid=1000,mode=0400 \
 USER root
 
 # ── erpnext_mcp is a PRIVATE repo: the build needs a read-only token ──
-# Both GitHub calls below authenticate with a fine-grained PAT
+# The clone below authenticates with a fine-grained PAT
 # (Contents: read-only on erpnext_mcp, farm_i9 and farm_precision_ag)
 # passed as a BuildKit SECRET; farm_i9 and farm_precision_ag above use
 # the same one:
 #
 #   cd fafo-erpnext/build
 #   export GH_TOKEN=<fine-grained read-only token>
-#   DOCKER_BUILDKIT=1 docker build --no-cache \
+#   docker buildx build --builder colima --provenance=false --sbom=false \
 #       --secret id=gh_token,env=GH_TOKEN \
 #       --build-arg ERPNEXT_MCP_VERSION=<x.y.z> \
+#       --build-arg ERPNEXT_MCP_SHA=<40-hex> --build-arg FARM_I9_SHA=<40-hex> \
+#       --build-arg FARM_PRECISION_AG_SHA=<40-hex> \
 #       -t polehntim/erpnext-umbrel:15 .
 #   docker push polehntim/erpnext-umbrel:15
+#
+# The deploy file reads the three SHAs from GitHub with the same token
+# right before the build. A CACHED build is the standard one: only the
+# layers from the first changed app down rebuild. Add `--no-cache
+# --pull` for the monthly clean rebuild, or when the base image changes.
 #
 # The secret is mounted at /run/secrets/gh_token for one RUN step
 # only. NEVER pass the token as an ARG or ENV: those are recorded in
@@ -342,20 +376,15 @@ USER root
 # ── Build record: the erpnext_mcp commit this image was built from ──
 # deploy_status.py reads /tmp/.erpnext_mcp_head.json ({"sha": ...}).
 # Only the sha is kept — the full API response would bake the last
-# commit's diff into the image. This RUN also acts as the cache-buster
-# for --no-cache builds; ERPNEXT_MCP_VERSION below is the manual one:
-# it is expanded into the RUN command, so changing it changes the
-# layer key. Comments do NOT work for this; Docker strips them before
+# commit's diff into the image. It is written from ERPNEXT_MCP_SHA
+# once the clone is proved to be that commit. ERPNEXT_MCP_SHA (and
+# ERPNEXT_MCP_VERSION, expanded into the RUN command) are what change
+# the layer key: a comment would not — Docker strips comments before
 # hashing the instruction.
-RUN --mount=type=secret,id=gh_token,required=true \
-    set -eu; \
-    test -s /run/secrets/gh_token || { echo "[dockerfile] gh_token secret is empty — pass --secret id=gh_token,env=GH_TOKEN" >&2; exit 1; }; \
-    curl -sfSL --retry 3 --retry-delay 5 \
-      -H "Authorization: Bearer $(cat /run/secrets/gh_token)" \
-      https://api.github.com/repos/polehntim-commits/erpnext_mcp/commits/main \
-      -o /tmp/.erpnext_mcp_commit.json; \
-    python3 -c 'import json; d = json.load(open("/tmp/.erpnext_mcp_commit.json")); json.dump({"sha": d["sha"], "branch": "main"}, open("/tmp/.erpnext_mcp_head.json", "w"))'; \
-    rm -f /tmp/.erpnext_mcp_commit.json
+# The commit to bake is a BUILD ARG (ERPNEXT_MCP_SHA, the full 40-hex SHA the deploy command reads from
+# GitHub just before the build). It is what busts this app's cache — and only from here down —
+# when erpnext_mcp moves; the clone below must land on exactly that commit or the build fails.
+ARG ERPNEXT_MCP_SHA
 ARG ERPNEXT_MCP_VERSION=0.18.0
 
 # ── Bake polehntim/erpnext_mcp into the image ─────────────────────
@@ -395,7 +424,8 @@ USER frappe
 RUN --mount=type=secret,id=gh_token,required=true,uid=1000,mode=0400 \
     set -eu; \
     cd /home/frappe/frappe-bench; \
-    echo "[dockerfile] baking erpnext_mcp target ${ERPNEXT_MCP_VERSION}"; \
+    echo "${ERPNEXT_MCP_SHA}" | grep -Eqx '[0-9a-f]{40}' || { echo "[dockerfile] pass --build-arg ERPNEXT_MCP_SHA=<the 40-hex commit of erpnext_mcp main> — failing the build" >&2; exit 1; }; \
+    echo "[dockerfile] baking erpnext_mcp target ${ERPNEXT_MCP_VERSION} at ${ERPNEXT_MCP_SHA}"; \
     tok="$(cat /run/secrets/gh_token)"; \
     auth="$(printf 'x-access-token:%s' "$tok" | base64 | tr -d '\n')"; \
     GIT_CONFIG_COUNT=1 \
@@ -403,6 +433,9 @@ RUN --mount=type=secret,id=gh_token,required=true,uid=1000,mode=0400 \
     GIT_CONFIG_VALUE_0="Authorization: Basic ${auth}" \
       bench get-app --branch main erpnext_mcp https://github.com/polehntim-commits/erpnext_mcp.git; \
     test -f apps/erpnext_mcp/erpnext_mcp/__init__.py || { echo "[dockerfile] erpnext_mcp get-app left no app at apps/erpnext_mcp — failing the build" >&2; exit 1; }; \
+    got="$(git -C apps/erpnext_mcp rev-parse HEAD)"; \
+    [ "$got" = "${ERPNEXT_MCP_SHA}" ] || { echo "[dockerfile] erpnext_mcp main is $got, not the ERPNEXT_MCP_SHA ${ERPNEXT_MCP_SHA} this build was asked for (pushed mid-build?) — failing the build" >&2; exit 1; }; \
+    printf '{"sha": "%s", "branch": "main"}' "$got" > /tmp/.erpnext_mcp_head.json; \
     rm -rf apps/erpnext_mcp/.git apps/erpnext_mcp/docs apps/erpnext_mcp/RELEASES \
            apps/erpnext_mcp/tests_standalone apps/erpnext_mcp/CHANGELOG.md; \
     env/bin/pip install -e apps/erpnext_mcp --force-reinstall --no-deps; \
@@ -422,14 +455,6 @@ RUN --mount=type=secret,id=gh_token,required=true \
       echo "[dockerfile] the GitHub token was found in the image — failing the build" >&2; exit 1; \
     fi
 USER frappe
-# erpnext_mcp declares these and imports every one of them defensively: without
-# shapely and h3 the six boundary tools go unavailable, without reportlab the two
-# tax-form PDF tools do (v0.36.0), and in both cases they say so by name rather
-# than taking the rest of the app down with them. Baked in so the image never
-# ships in that degraded state.
-RUN cd /home/frappe/frappe-bench && \
-    echo "[dockerfile] installing erpnext_mcp dependencies (shapely, h3, reportlab)" && \
-    env/bin/pip install shapely h3 reportlab
 
 USER root
 
@@ -442,7 +467,8 @@ USER root
 # immediately without a 15-min Pi-side rebuild.
 USER frappe
 RUN cd /home/frappe/frappe-bench && \
-    (bench build --production || echo "[dockerfile] bench build failed — will retry in entrypoint")
+    (bench build --apps erpnext_mcp,farm_i9,farm_precision_ag --production \
+     || echo "[dockerfile] bench build (private apps) failed — will retry in entrypoint")
 USER root
 RUN if [ -d /home/frappe/frappe-bench/sites/assets ]; then \
         mkdir -p /var/lib/frappe-assets && \
