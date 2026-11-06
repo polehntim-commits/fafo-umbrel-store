@@ -135,17 +135,15 @@ RUN sed -i 's/^bind .*/bind 127.0.0.1 ::1/' /etc/redis/redis.conf && \
 #   1. `bench get-app` sometimes reports success but leaves the app
 #      un-pip-installed. We follow with an explicit `pip install -e`
 #      + --force-reinstall so the editable install is guaranteed.
-#   2. Docker's layer cache doesn't know when GitHub has new commits.
-#      The ADD https://api.github.com/... below returns the current
-#      HEAD SHA in its body; when agriculture develop advances the
-#      SHA changes and Docker invalidates every layer from here down,
-#      forcing a fresh clone + install.
-
-# ── Cache-bust when frappe/agriculture develop advances ──────────
-# Same pattern as hrms below. Less frequently updated so the
-# cache-bust rarely fires, but consistency is worth the one extra
-# HTTP request at build time.
-ADD https://api.github.com/repos/frappe/agriculture/commits/develop /tmp/.agriculture_head.json
+#   2. NO CACHE-BUST (2026-11-06). This layer used to start with an
+#      unauthenticated `ADD https://api.github.com/.../commits/develop`
+#      so a new agriculture commit invalidated the cache. A GitHub 504
+#      (or the 60-an-hour anonymous rate limit) on that ADD failed the
+#      whole build ("failed to load cache key: invalid response status
+#      504", Tim's 0.370.0 build). Agriculture is a candidate for
+#      removal (ERPNext v16 note) and barely moves, so the layer now
+#      stays cached until the monthly clean rebuild (`--no-cache
+#      --pull`, the deploy file's appendix) fetches develop afresh.
 USER frappe
 RUN cd /home/frappe/frappe-bench && \
     (bench get-app --branch develop agriculture https://github.com/frappe/agriculture.git \
@@ -162,11 +160,14 @@ USER root
 # It used to track the version-15 branch HEAD, which meant the HRMS
 # in the image was whatever HEAD happened to be at build time — not
 # something a rollback note or an advisory check can name. It is now
-# a tag, bumped deliberately alongside the base image above. The
-# commits endpoint accepts a tag as the ref, so the cache key still
-# changes when HRMS_REF does.
+# a tag, bumped deliberately alongside the base image above.
+#
+# NO API LOOKUP (2026-11-06). The cache key used to come from an
+# unauthenticated `ADD https://api.github.com/repos/frappe/hrms/commits/
+# ${HRMS_REF}`; a GitHub 504 there failed Tim's 0.370.0 build. A tag
+# never moves, so nothing needs busting: the RUN below names
+# ${HRMS_REF}, and Docker re-runs it exactly when HRMS_REF changes.
 ARG HRMS_REF=v15.64.5
-ADD https://api.github.com/repos/frappe/hrms/commits/${HRMS_REF} /tmp/.hrms_head.json
 
 # ── Bake frappe/hrms into the image ───────────────────────────────
 # Frappe Technologies' official HR + Payroll app. Layers Employee,
@@ -196,7 +197,8 @@ USER root
 # ── FAST BUILD (2026-11-04): the slow, stable layers come first ───
 # Everything above this line changes only when a pin changes: the base
 # image digest, the apt list, agriculture's develop head, HRMS_REF, or
-# the pip set below. Everything after it is Tim's own apps, which
+# the pip set below (agriculture refreshes on the clean rebuild only,
+# since 2026-11-06). Everything after it is Tim's own apps, which
 # change on most builds. With the standard (cached) build, a new
 # erpnext_mcp commit rebuilds only the layers from its clone down;
 # apt, agriculture, hrms and this full asset build come from cache.
