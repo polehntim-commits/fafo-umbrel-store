@@ -302,6 +302,28 @@ Alert codes the kit raises:
 one option. Set it with `sudo bash bin/set-conf.sh NOTIFY_URL --prompt` so it never lands in shell
 history.
 
+**Email (kit 2026-11-08.1).** `NOTIFY_URL=mailto:ADDRESS` sends each message as a plain-text email instead of a
+POST, straight from the box with `curl` over SMTP. No ERPNext, no third party, and it still works while ERPNext
+is down. It needs:
+
+- `NOTIFY_SMTP_URL`: default `smtps://smtp.zoho.com:465`. Use `smtp://host:587` for STARTTLS. TLS is always
+  required.
+- `NOTIFY_SMTP_USER`: the mailbox to log in as (e.g. `office@orchardmeadow.net`). It is also the From address,
+  unless `NOTIFY_FROM` is set.
+- `NOTIFY_SMTP_PASS`: set with `--prompt`.
+  - Use an app-specific password.
+  - It is stored single-quoted in the root-only conf, so `$` and backticks stay literal. A single quote, `|`,
+    `&`, `\` and `"` are refused.
+  - It is handed to curl through a file descriptor, never on its command line.
+  - `status.sh` shows only whether it is set.
+
+Set the SMTP settings first and the address last. The address triggers the test email, then one listing every
+problem already open. Changing any `NOTIFY_SMTP_*` setting while the address is set sends the test again.
+
+**`NOTIFY_IGNORE`** (comma-separated codes, e.g. `LINK_SLOW,LINK_RELAYED`) keeps standing, harmless warnings
+out of the messages. They still show in `status.sh` and in ERPNext. When only ignored codes are left, the
+message is "recovered".
+
 ## Install
 
 ```sh
@@ -331,6 +353,8 @@ changed. `oml` and `umbrellocal` remain accepted as role names for boxes install
 | `bin/promote-standby.sh`, `demote.sh`, `fence.sh` | Failover and failback (see the runbook). |
 
 ## Tests
+
+`tests/notify-mail.sh` covers email notifications and `NOTIFY_IGNORE` without ERPNext: a local SMTP sink, the harness image, about 10 s.
 
 `tests/e2e.sh` drives two real ERPNext containers through every path above:
 

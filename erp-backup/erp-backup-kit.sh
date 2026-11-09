@@ -19,7 +19,7 @@
 # (new keys are appended; change values with bin/set-conf.sh). Never edits app compose files or app-data, never
 # restarts the ERPNext containers, never writes secrets to disk. Hosts, names and paths live only in the conf.
 set -euo pipefail
-KIT_VERSION="2026-10-24.1"
+KIT_VERSION="2026-11-08.1"
 
 ROLE="${1:-}"; [ $# -gt 0 ] && shift
 ARG_ME=""; ARG_PEER=""; ARG_PEER_HOST=""; ARG_PRIMARY_HOSTNAME=""; ARG_CONTAINER=""; FORCE_INSTALL=0; NO_WAIT=0
@@ -171,6 +171,14 @@ addconf PURGE_BENCH_PLAINTEXT 1
 addconf STATUS_TO_CONTAINER 1
 addconf NOTIFY_URL '""'
 addconf NOTIFY_REPEAT_HOURS 24
+# 2026-11-08.1: NOTIFY_URL=mailto:ADDRESS sends each message as an email through this SMTP server, straight from
+# the box with curl (no ERPNext, no third party, works while ERPNext is down). NOTIFY_SMTP_PASS is entered with
+# set-conf.sh NOTIFY_SMTP_PASS --prompt and is never printed or put on a command line.
+addconf NOTIFY_SMTP_URL smtps://smtp.zoho.com:465
+addconf NOTIFY_SMTP_USER '""'
+addconf NOTIFY_SMTP_PASS '""'
+addconf NOTIFY_FROM '""'
+addconf NOTIFY_IGNORE '""'
 addconf WATCHDOG_TIME "$WATCHDOG_TIME"
 addconf STANDBY_WAIT_MIN 240
 addconf PUSH_WAIT_MIN 300
@@ -223,20 +231,42 @@ DOCTYPES=("GL Entry" "Journal Entry" "Sales Invoice" "Purchase Invoice" "Payment
 log()    { echo "$(date -Is) [$ME/$STAGE] $*"; }
 status() { echo "$(date -Is) $*" >> "$STATUS"; }
 notify() { notify_send "$*" || true; }
-notify_send() { [ -n "${NOTIFY_URL:-}" ] || return 2; curl -fsS -m 15 -d "[$ME] $*" "$NOTIFY_URL" >/dev/null 2>&1; }
+notify_send() { [ -n "${NOTIFY_URL:-}" ] || return 2
+  case "$NOTIFY_URL" in mailto:*) notify_mail "$*";; *) curl -fsS -m 15 -d "[$ME] $*" "$NOTIFY_URL" >/dev/null 2>&1;; esac; }
+# notify_mail MESSAGE (2026-11-08.1): NOTIFY_URL=mailto:ADDRESS. One plain-text email through NOTIFY_SMTP_URL, logged
+# in as NOTIFY_SMTP_USER. The login goes to curl through a config on a file descriptor, never on its command line
+# (ps would show it). Returns non-zero when anything is missing or the server refuses, so nothing counts as sent.
+notify_mail() {
+  local to="${NOTIFY_URL#mailto:}" from="${NOTIFY_FROM:-${NOTIFY_SMTP_USER:-}}" subj
+  [[ "$to" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[A-Za-z]{2,}$ ]] || return 3
+  [ -n "${NOTIFY_SMTP_URL:-}" ] && [ -n "${NOTIFY_SMTP_USER:-}" ] && [ -n "${NOTIFY_SMTP_PASS:-}" ] && [ -n "$from" ] || return 4
+  subj="[erp-backup $ME] $(printf '%s' "$1" | tr -d '\r\n' | cut -c1-90)"
+  printf 'From: erp-backup %s <%s>\r\nTo: <%s>\r\nSubject: %s\r\nDate: %s\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n[%s on %s]\r\n%s\r\n' \
+      "$ME" "$from" "$to" "$subj" "$(LC_ALL=C date -R)" "$ME" "$(hostname)" "$1" |
+    curl -fsS -m 30 --ssl-reqd --url "$NOTIFY_SMTP_URL" --mail-from "$from" --mail-rcpt "$to" --upload-file - \
+      -K <(printf 'user = "%s:%s"\n' "$NOTIFY_SMTP_USER" "$NOTIFY_SMTP_PASS") >/dev/null 2>&1
+}
 # notify_check: one message when the set of problems in status.json changes (or NOTIFY_REPEAT_HOURS pass), one
 # "recovered" when it clears. Nothing is remembered while NOTIFY_URL is empty or a send fails, so problems that
 # exist when notifications are switched on are announced at the first check after that, not swallowed.
 notify_check() {
   [ -n "${NOTIFY_URL:-}" ] && [ -f "$BASE/status.json" ] || return 0
   local overall codes msg lastc lastat age
-  read -r overall codes msg < <(python3 - "$BASE/status.json" <<'PY'
-import json, sys
+  read -r overall codes msg < <(ERPB_IGNORE="${NOTIFY_IGNORE:-}" python3 - "$BASE/status.json" <<'PY'
+import json, os, sys
 try: s = json.load(open(sys.argv[1]))
 except Exception: print("critical STATUS_UNREADABLE status.json unreadable"); raise SystemExit
-codes = sorted({a["code"] for a in s.get("alerts", [])})
-msg = "; ".join(f'{a["code"]}: {a["message"]}' for a in s.get("alerts", []))[:600].replace("\n", " ")
-print(s.get("overall", "critical"), ",".join(codes) or "-", msg or "-")
+alerts = s.get("alerts", [])
+overall = s.get("overall", "critical")
+# NOTIFY_IGNORE (2026-11-08.1): codes never sent (e.g. LINK_SLOW). They stay in status and ERPNext; only the message skips them.
+ignore = {c.strip() for c in os.environ.get("ERPB_IGNORE", "").split(",") if c.strip()}
+if ignore:
+    alerts = [a for a in alerts if a.get("code") not in ignore]
+    levels = {a.get("level") for a in alerts}
+    overall = "critical" if "critical" in levels else ("warning" if alerts else "ok")
+codes = sorted({a["code"] for a in alerts})
+msg = "; ".join(f'{a["code"]}: {a["message"]}' for a in alerts)[:600].replace("\n", " ")
+print(overall, ",".join(codes) or "-", msg or "-")
 PY
 )
   lastc=$(state_get notify codes); lastat=$(state_get notify at); age=999
@@ -1904,19 +1934,23 @@ grep -q "^$K=" "$BASE/erp-backup.conf" || die "no setting $K in erp-backup.conf"
 case "$K" in ME|PEER_NAME|BASE) die "$K is set by the installer; re-install instead";; esac
 if [ "$V" = --prompt ]; then read -rsp "$K (hidden): " V; echo; SECRET=1; else SECRET=0; [ $# -eq 2 ] || die "give exactly one VALUE (quote it if it has spaces)"; fi
 [[ "$V" != *$'\n'* && "$V" != *'|'* && "$V" != *'&'* && "$V" != *'\'* && "$V" != *'"'* ]] || die "value may not contain newline, |, &, \\ or \""
-[[ "$V" == *' '* || -z "$V" ]] && V="\"$V\""
+# a hidden value (a password) is stored in single quotes: the conf is sourced, and a $ or ` in it must stay literal
+if [ "$SECRET" = 1 ] && [ -n "$V" ]; then [[ "$V" != *"'"* ]] || die "a hidden value may not contain a single quote"; V="'$V'"
+elif [[ "$V" == *' '* || -z "$V" ]]; then V="\"$V\""; fi
 OLD=$(sed -n "s/^$K=//p" "$BASE/erp-backup.conf" | tail -n1)
 setconf "$K" "$V"
 if [ "$SECRET" = 1 ]; then echo "$K updated (value not shown)"; status "OK set-conf $K (hidden)"
 else echo "$K: $OLD -> $V"; status "OK set-conf $K=$V"; fi
 case "$K" in *_TIME|*_AT|*_CALENDAR|*_ENABLED|TARGET2_KIND|STANDBY_EVERY) echo "Schedule changed: run  sudo bash $(dirname "$0")/install.sh";; esac
-if [ "$K" = NOTIFY_URL ]; then
+if [ "$K" = NOTIFY_URL ] || { [[ "$K" == NOTIFY_SMTP_* || "$K" = NOTIFY_FROM ]] && grep -q "^NOTIFY_URL=\"\?mailto:" "$BASE/erp-backup.conf"; }; then
   . "$BASE/erp-backup.conf"
   if [ -z "${NOTIFY_URL:-}" ]; then echo "Notifications are off."
   elif notify_send "test: erp-backup notifications are on for $ME ($(hostname))"; then
     echo "Test notification sent."; rm -f "$STATE/notify.env"; bash "$(dirname "$0")/report.sh" >/dev/null 2>&1 || true; notify_check
     echo "Open problems (if any) were announced: $(python3 -c 'import json,sys; print(",".join(sorted({a["code"] for a in json.load(open(sys.argv[1])).get("alerts",[])})) or "none")' "$BASE/status.json" 2>/dev/null)"
-  else echo "WARN: the test notification could not be sent to that URL (check it, then set it again)."; fi
+  else case "$NOTIFY_URL" in
+         mailto:*) echo "WARN: the test email could not be sent. Needs NOTIFY_SMTP_URL, NOTIFY_SMTP_USER, NOTIFY_SMTP_PASS (--prompt) and a valid address; check them, then set NOTIFY_SMTP_PASS again.";;
+         *) echo "WARN: the test notification could not be sent to that URL (check it, then set it again).";; esac; fi
 fi
 EOF_SETCONF
 
@@ -2614,7 +2648,7 @@ echo "===== erp-backup status: $(hostname) role=$ME kit=$(cat "$BASE/KIT_VERSION
 [ -f "$BASE/FENCED" ] && echo "!!!!! FENCED: production site is read-only"
 echo "--- config"
 grep -E '^(CONTAINER|SITE|KEEP_|WEEKLY_DOW|BACKUP_TIME|CHECK_TIME|WATCHDOG_TIME|PEER_NAME|PEER_HOST|PRIMARY_HOSTNAME|RECV_DIR|MAX_AGE_HOURS|SEND_ENABLED|RECV_ENABLED|SEND_STANDBY_SET|STANDBY_ENABLED|ALLOW_STANDBY|EXPECT_REMOTE_RESTORE|STANDBY_SITE|PROMOTE_ALLOWED|ALLOW_ARCHIVE_TEST|PURGE_BENCH_PLAINTEXT|DB_CONTAINER|DBPW_SOURCE|STANDBY_EVERY|STANDBY_DAY|STANDBY_AT|STANDBY_WAIT_MIN|STANDBY_MIN_AVAIL_MB|STANDBY_MAX_SWAP_PCT|STANDBY_STOP_APPS_ENABLED|STANDBY_STOP_APPS|REMOTE_RESTORE_MAX_HOURS|TS_MODE|TS_CONTAINER|PUSH_TRANSPORT|PEER_LOCAL_DIR|PEER_STATUS_TO_CONTAINER|TARGET2_[A-Z_]+|RCLONE_IMAGE|SCRUB_CALENDAR|STAGE_[A-Z_]+|NOTIFY_REPEAT_HOURS)=' "$BASE/erp-backup.conf"
-echo "ARCHIVE_RECIPIENT: $([ -n "${ARCHIVE_RECIPIENT:-}" ] && echo "${ARCHIVE_RECIPIENT:0:16}...${ARCHIVE_RECIPIENT: -6}" || echo NOT SET)   NOTIFY_URL set: $([ -n "${NOTIFY_URL:-}" ] && echo yes || echo no)"
+echo "ARCHIVE_RECIPIENT: $([ -n "${ARCHIVE_RECIPIENT:-}" ] && echo "${ARCHIVE_RECIPIENT:0:16}...${ARCHIVE_RECIPIENT: -6}" || echo NOT SET)   NOTIFY_URL set: $([ -n "${NOTIFY_URL:-}" ] && { case "$NOTIFY_URL" in mailto:*) echo "yes (email via ${NOTIFY_SMTP_URL:-?} as ${NOTIFY_SMTP_USER:-?}, password $([ -n "${NOTIFY_SMTP_PASS:-}" ] && echo set || echo NOT SET))";; *) echo yes;; esac; } || echo no)"
 echo "age: $("$AGE" --version 2>/dev/null || echo MISSING)   db container: $(. "$BASE/bin/lib-site.sh"; find_db_container || true)"
 echo "--- containers / sites"
 docker ps --format '{{.Names}}  {{.Status}}' 2>/dev/null | grep -i erpnext || echo "(no erpnext containers seen)"
