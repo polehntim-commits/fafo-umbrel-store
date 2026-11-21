@@ -93,6 +93,9 @@ USER root
 # user's primary group is deliberately left as upstream set it.
 RUN getent group frappe >/dev/null || groupadd -g 1000 frappe
 
+# erpnext_mcp v0.420.0 (file_previews): libreoffice-calc / -impress turn .xlsx / .pptx handouts into PDFs a phone
+# opens inline (Writer already did .docx), and ffmpeg turns an uploaded video into an H.264/AAC MP4 with faststart so
+# iOS can stream it. All offline, in the container. docs/contracts/file_previews_v1.md in erpnext_mcp.
 # Install supervisord to orchestrate the multiple Frappe processes,
 # plus redis-server (bundled inside the container so we stay one
 # service from Umbrel's perspective).
@@ -102,6 +105,9 @@ RUN apt-get update && \
         redis-server \
         netcat-openbsd \
         libreoffice-writer \
+        libreoffice-calc \
+        libreoffice-impress \
+        ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Redis tuning: bind localhost only (no external access), cap memory
