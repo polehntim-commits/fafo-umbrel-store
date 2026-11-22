@@ -216,9 +216,11 @@ USER frappe
 # tax-form PDF tools do (v0.36.0), and in both cases they say so by name rather
 # than taking the rest of the app down with them. Baked in so the image never
 # ships in that degraded state.
+# erpnext_mcp v0.438.1: APNs is HTTP/2-only — httpx with its http2 extra (h2). Without it every iPhone push fails
+# "no_http2_client" (OML, 2026-11-21). Pinned.
 RUN cd /home/frappe/frappe-bench && \
-    echo "[dockerfile] installing erpnext_mcp dependencies (shapely, h3, reportlab)" && \
-    env/bin/pip install shapely h3 reportlab
+    echo "[dockerfile] installing erpnext_mcp dependencies (shapely, h3, reportlab, httpx[http2])" && \
+    env/bin/pip install shapely h3 reportlab "httpx[http2]==0.28.1" "h2==4.1.0"
 
 # Full production build of the STABLE apps' assets (frappe, erpnext,
 # agriculture, hrms — the apps in apps.txt at this point). Cached until
