@@ -1,5 +1,41 @@
 # Changelog — fafo-erpnext
 
+## Base image v15.126.0: Frappe 15.127.1, ERPNext 15.126.0, HRMS 15.64.9 (2026-11-22)
+
+Security update, shipped together with erpnext_mcp 0.440.0 in one deploy.
+
+| | was | now |
+|---|---|---|
+| Base image | `frappe/erpnext:v15.123.0@sha256:ad1f5677…` | `frappe/erpnext:v15.126.0@sha256:60d44e5e…` |
+| Frappe | 15.123.1 | 15.127.1 |
+| ERPNext | 15.123.0 | 15.126.0 |
+| HRMS | 15.64.5 | 15.64.9 |
+| Python / Node | 3.11.17 / 22.23.3 | 3.11.18 / 22.23.5 |
+| pypdf / Pillow (from Frappe) | 6.15.0 / 12.3.0 | 6.21.4 / 13.0.0 |
+
+Fixes Frappe GHSA-vwqr-4mjv-ffrm (high 8.5, unauthorised email through Communication), the ERPNext advisories
+fixed in 15.124.0–15.124.2 (worst: GHSA-64h3-xccr-q5jr 8.5, source documents through Payment Requests; two 7.7s
+through print / portal views) and HRMS GHSA-m8m7-r43p-2jjf plus the API permission checks of 15.64.6–15.64.9.
+
+Unlike 15.123, this migrate runs data patches (3 Frappe, ~25 ERPNext; HRMS none): Payment Schedule outstanding for
+0 % terms, Material Request ordered / received qty, In Words print defaults, Address "Is Your Company Address"
+permlevel, manufacturing and stock settings. Rolling back therefore means the previous image AND the pre-upgrade
+database backup; the deploy file's ROLLBACK section has the commands.
+
+Also pinned in the same layer: `shapely==2.2.0 h3==4.5.1 reportlab==5.1.0`. Unpinned, a base change re-ran the
+layer and took whatever PyPI had (reportlab had already moved 4.x -> 5.1.0 in the 0.440.0 build).
+
+Unchanged and re-checked: the `frappe` group fix and nvm `current` Node path still hold on this base; nginx
+`stopasgroup` restart verified again.
+
+Rehearsed on the Mac (test build with the private apps from local source; nothing on the servers): a 15.123 site
+upgraded to this image migrated in 42 s with 28 upstream patches; after `supervisorctl restart all` every program
+RUNNING and Desk, ping, assets and the farmops health answered. erpnext_mcp 0.440.0's in-bench suite on a fresh
+site: no test fails on 15.127.1 that passed on 15.123.1 (315 tests; 9 failures / 41 errors are the scratch site's
+missing company setup, 10 / 41 on the baseline). erpnext_mcp's standalone suite run INSIDE both images (real pypdf / Pillow / reportlab / segno): identical on
+both bases — 19,507 tests, the same 62 failing names (mostly test_governance_approvals / test_approval_links when run
+in a full bench environment), so nothing attributable to the framework or the pypdf 6.21 / Pillow 13 change.
+
 ## Cached builds: the private apps are pinned by commit (2026-11-04)
 
 Builds took 243–317 s because every one ran `--no-cache`. That flag was

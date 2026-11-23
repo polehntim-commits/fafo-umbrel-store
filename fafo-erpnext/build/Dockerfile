@@ -40,29 +40,31 @@
 # semantics, RAM isolation). Redis stays IN this container because
 # it's ephemeral cache — losing it on container restart is fine.
 #
-# Base image is `frappe/erpnext:v15.123.0` (Frappe Technologies'
+# Base image is `frappe/erpnext:v15.126.0` (Frappe Technologies'
 # official, has bench + all Python deps preinstalled). It ships
-# Frappe v15.123.1 + ERPNext v15.123.0. We just layer supervisord,
+# Frappe v15.127.1 + ERPNext v15.126.0. We just layer supervisord,
 # redis-server, and our config on top.
 #
 # Pinned by tag AND digest (2026-10-18). The digest makes a rebuild
 # of this Dockerfile reproduce the same Frappe/ERPNext code even if
 # upstream re-pushes the tag; bumping the base means changing both.
-# Previous base: v15.115.0 (Frappe 15.113.4) — see CHANGELOG.md,
-# "Base image v15.123.0" (2026-10-18).
+# Previous bases: v15.123.0@sha256:ad1f5677… (Frappe 15.123.1, 2026-10-18 to
+# 2026-11-22) and v15.115.0 (Frappe 15.113.4) — see CHANGELOG.md. Note:
+# upstream has since RE-PUSHED the v15.123.0 tag (now sha256:33f97d0f…);
+# the digest pin is what kept rebuilds reproducible.
 #
 # Apps baked into the image (cloned at build time so they survive
 # container recreates — Umbrel bind-mounts sites/ but not apps/):
 #   * agriculture — frappe/agriculture (branch develop)
 #   * farm_i9     — polehntim-commits/farm_i9 (branch main, PRIVATE), the
 #                   US-compliance layer (workspace: Farm HR)
-#   * hrms        — frappe/hrms (tag HRMS_REF, v15.64.5), Frappe HR +
+#   * hrms        — frappe/hrms (tag HRMS_REF, v15.64.9), Frappe HR +
 #                   Payroll framework that farm_i9 rides on top of
 #   * farm_precision_ag — polehntim-commits/farm_precision_ag (branch
 #                   main, PRIVATE), precision-ag suite (Phase B: USDA Market
 #                   Pricing; Land/Blocks/Spray/IPM/Costing follow)
 
-FROM frappe/erpnext:v15.123.0@sha256:ad1f567771a87961c20f1516df6b11228a3eac31cfba00d358b23803b7b44f4b
+FROM frappe/erpnext:v15.126.0@sha256:60d44e5e5aa0a6478f891270e674a752100e06b522f4328261bb0a69af67be62
 
 # Self-heal advertisement — lets an operator confirm at a glance
 # (`docker inspect`) that this image carries the runtime recovery
@@ -173,7 +175,7 @@ USER root
 # ${HRMS_REF}`; a GitHub 504 there failed Tim's 0.370.0 build. A tag
 # never moves, so nothing needs busting: the RUN below names
 # ${HRMS_REF}, and Docker re-runs it exactly when HRMS_REF changes.
-ARG HRMS_REF=v15.64.5
+ARG HRMS_REF=v15.64.9
 
 # ── Bake frappe/hrms into the image ───────────────────────────────
 # Frappe Technologies' official HR + Payroll app. Layers Employee,
@@ -182,7 +184,7 @@ ARG HRMS_REF=v15.64.5
 # farm_i9 (workspace: Farm HR) rides on top of these DocTypes for
 # US-specific compliance (I-9, W-4, W-2, etc.).
 #
-# HRMS_REF is a v15 tag matching the ERPNext v15.123.0 base image. Two-
+# HRMS_REF is a v15 tag matching the ERPNext v15.126.0 base image. Two-
 # step install (get-app + explicit pip install -e) matches the
 # farm_i9 and agriculture blocks — bench get-app has a silent-fail
 # pip step, so we always follow with an explicit pip install to
@@ -218,9 +220,12 @@ USER frappe
 # ships in that degraded state.
 # erpnext_mcp v0.438.1: APNs is HTTP/2-only — httpx with its http2 extra (h2). Without it every iPhone push fails
 # "no_http2_client" (OML, 2026-11-21). Pinned.
+# shapely / h3 / reportlab pinned too (2026-11-22): unpinned, a base-image change re-ran this layer and silently
+# took whatever PyPI had that day (reportlab went 4.x -> 5.1.0 in the 0.440.0 build). These are the versions the
+# 0.440.0 image and the v15.126.0 rebuild both resolved to and were tested with; bump them on purpose.
 RUN cd /home/frappe/frappe-bench && \
     echo "[dockerfile] installing erpnext_mcp dependencies (shapely, h3, reportlab, httpx[http2])" && \
-    env/bin/pip install shapely h3 reportlab "httpx[http2]==0.28.1" "h2==4.1.0"
+    env/bin/pip install "shapely==2.2.0" "h3==4.5.1" "reportlab==5.1.0" "httpx[http2]==0.28.1" "h2==4.1.0"
 
 # Full production build of the STABLE apps' assets (frappe, erpnext,
 # agriculture, hrms — the apps in apps.txt at this point). Cached until
