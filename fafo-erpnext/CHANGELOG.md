@@ -2,7 +2,7 @@
 
 ## Base image v15.126.0: Frappe 15.127.1, ERPNext 15.126.0, HRMS 15.64.9 (2026-11-22)
 
-Security update, shipped together with erpnext_mcp 0.440.0 in one deploy.
+Security update, shipped together with erpnext_mcp 0.441.0 in one deploy (it superseded 0.440.0 the same day).
 
 | | was | now |
 |---|---|---|
@@ -28,12 +28,13 @@ layer and took whatever PyPI had (reportlab had already moved 4.x -> 5.1.0 in th
 Unchanged and re-checked: the `frappe` group fix and nvm `current` Node path still hold on this base; nginx
 `stopasgroup` restart verified again.
 
-Rehearsed on the Mac (test build with the private apps from local source; nothing on the servers): a 15.123 site
-upgraded to this image migrated in 42 s with 28 upstream patches; after `supervisorctl restart all` every program
-RUNNING and Desk, ping, assets and the farmops health answered. erpnext_mcp 0.440.0's in-bench suite on a fresh
-site: no test fails on 15.127.1 that passed on 15.123.1 (315 tests; 9 failures / 41 errors are the scratch site's
-missing company setup, 10 / 41 on the baseline). erpnext_mcp's standalone suite run INSIDE both images (real pypdf / Pillow / reportlab / segno): identical on
-both bases — 19,507 tests, the same 62 failing names (mostly test_governance_approvals / test_approval_links when run
+Rehearsed on the Mac (test build with the private apps from local source; nothing on the servers), on the servers'
+own path: a site at erpnext_mcp 0.437.0 on 15.123 upgraded to 0.441.0 on this image migrated in 33 s (28 upstream
+patches + 2 of erpnext_mcp's; the bank hint field's Link -> Data patch works on 15.127.1); after `supervisorctl restart all` every program
+RUNNING and Desk, ping, assets and the farmops health answered. erpnext_mcp's in-bench suite (0.440.0 and again 0.441.0):
+no test fails on 15.127.1 that passed on 15.123.1 (315 tests; 9 failures / 41 errors are the scratch site's missing
+company setup, 10 / 41 on the baseline). erpnext_mcp's standalone suite run INSIDE both images (real pypdf / Pillow / reportlab / segno): identical on
+both bases (0.440.0: 19,507 tests; 0.441.0: 19,531) — the same 62 failing names (mostly test_governance_approvals / test_approval_links when run
 in a full bench environment), so nothing attributable to the framework or the pypdf 6.21 / Pillow 13 change.
 
 ## Cached builds: the private apps are pinned by commit (2026-11-04)
